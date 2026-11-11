@@ -17,7 +17,7 @@ concurrency:
 jobs:
   bridge:
     runs-on: windows-2022
-    timeout-minutes: 35
+    timeout-minutes: 15
     permissions:
       contents: read
     env:
@@ -40,6 +40,28 @@ jobs:
     steps:
       - name: Checkout bridge
         uses: actions/checkout@v4
+
+      - name: Set up supported Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Preflight verify scripts and safety locks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m py_compile demo_gold_limit.py mt5_bridge.py
+          $loginScript = Get-Content "demo_gold_limit.py" -Raw
+          if ($loginScript -notmatch "mt5\.initialize\(" -or
+              $loginScript -notmatch "login=LOGIN" -or
+              $loginScript -notmatch "password=PASSWORD" -or
+              $loginScript -notmatch "server=SERVER") {
+            throw "Preflight failed: backend login parameters are incomplete."
+          }
+          if ($loginScript -match "order_send\(") {
+            throw "Preflight failed: login-only test must not contain order submission."
+          }
+          Write-Host "PREFLIGHT PASSED: Python syntax valid; backend credentials wired; no order submission in login test."
 
       - name: Validate required configuration
         shell: pwsh
@@ -85,11 +107,6 @@ jobs:
           New-NetFirewallRule -DisplayName "RDP only over Tailscale" -Direction Inbound -Protocol TCP -LocalPort 3389 -RemoteAddress "100.64.0.0/10" -Action Allow
           Restart-Service TermService -Force
           Write-Host "RDP enabled with NLA and restricted to Tailscale addresses. Password not printed."
-
-      - name: Set up supported Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
 
       - name: Install Python dependencies
         shell: pwsh
@@ -157,14 +174,14 @@ jobs:
         if: ${{ always() && env.TAILSCALE_AUTHKEY != '' && env.RDP_PASSWORD != '' }}
         shell: pwsh
         run: |
-          Write-Host "RDP is available over Tailscale for 20 minutes. Connect now."
+          Write-Host "RDP is available over Tailscale for 90 seconds. Connect now."
           if ($env:TAILSCALE_IP) {
             $details = "Host: $env:TAILSCALE_IP`r`nUsername: RDP`r`nPort: 3389`r`nPassword: use repository secret RDP_PASSWORD`r`n"
             $details | Out-File -FilePath "connection-details.txt" -Encoding utf8
-            "## RDP connection details`n`n- Host: **$env:TAILSCALE_IP**`n- Username: **RDP**`n- Port: **3389**`n- Password: use the repository secret `RDP_PASSWORD`.`n`nThis runner shuts down after the 20-minute window." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            "## RDP connection details`n`n- Host: **$env:TAILSCALE_IP**`n- Username: **RDP**`n- Port: **3389**`n- Password: use the repository secret `RDP_PASSWORD`.`n`nThis runner shuts down after the 90-second window." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             Write-Host "RDP Host: $env:TAILSCALE_IP | Username: RDP | Port: 3389"
           }
-          Start-Sleep -Seconds 1200
+          Start-Sleep -Seconds 90
 
       - name: Upload bridge journal
         if: always()
