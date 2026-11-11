@@ -131,9 +131,13 @@ jobs:
           "MT5_TERMINAL_PATH=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "MT5 terminal verified at: $terminal"
 
+      - name: Place fixed demo gold Buy Limit (duplicate-protected)
+        shell: pwsh
+        run: python demo_gold_limit.py
+
       - name: Compile bridge
         shell: pwsh
-        run: python -m py_compile mt5_bridge.py
+        run: python -m py_compile mt5_bridge.py demo_gold_limit.py
 
       - name: Run signal bridge
         if: ${{ env.SIGNALS_URL != '' && env.SIGNALS_ACCESS_KEY != '' }}
@@ -154,7 +158,10 @@ jobs:
         run: |
           Write-Host "RDP is available over Tailscale for 20 minutes. Connect now."
           if ($env:TAILSCALE_IP) {
+            $details = "Host: $env:TAILSCALE_IP`r`nUsername: RDP`r`nPort: 3389`r`nPassword: use repository secret RDP_PASSWORD`r`n"
+            $details | Out-File -FilePath "connection-details.txt" -Encoding utf8
             "## RDP connection details`n`n- Host: **$env:TAILSCALE_IP**`n- Username: **RDP**`n- Port: **3389**`n- Password: use the repository secret `RDP_PASSWORD`.`n`nThis runner shuts down after the 20-minute window." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            Write-Host "RDP Host: $env:TAILSCALE_IP | Username: RDP | Port: 3389"
           }
           Start-Sleep -Seconds 1200
 
@@ -163,6 +170,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mt5-bridge-journal-${{ github.run_id }}
-          path: bridge_state.sqlite3
+          path: |
+            bridge_state.sqlite3
+            connection-details.txt
           if-no-files-found: ignore
           retention-days: 14
