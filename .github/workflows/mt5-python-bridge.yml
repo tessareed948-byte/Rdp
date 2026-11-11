@@ -171,6 +171,25 @@ jobs:
           }
           Write-Host "MT5 terminal process is running. Proceeding to Python IPC/demo login validation."
 
+      - name: Diagnose MT5 process and Python IPC
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Write-Host "Configured terminal path: $env:MT5_TERMINAL_PATH"
+          Write-Host "Configured terminal exists:"
+          Test-Path -LiteralPath $env:MT5_TERMINAL_PATH
+          Write-Host "Suggested Program Files path exists:"
+          Test-Path "C:\Program Files\MetaTrader 5\terminal64.exe"
+          Write-Host "Running terminal process details:"
+          $mt5 = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue
+          if ($mt5) {
+            $mt5 | Select-Object ProcessId, ExecutablePath, CommandLine | Format-List
+          } else {
+            Write-Host "NO terminal64.exe PROCESS FOUND"
+          }
+          Write-Host "Python package version and direct IPC probe:"
+          python -c "import os, MetaTrader5 as m; p=os.environ['MT5_TERMINAL_PATH']; print('package_version=',m.__version__); print('path=',p); ok=m.initialize(path=p, timeout=60000); print('initialize=',ok); print('last_error=',m.last_error()); m.shutdown() if ok else None"
+
       - name: Verify backend MT5 demo login and IPC (no orders)
         shell: pwsh
         run: python demo_gold_limit.py
