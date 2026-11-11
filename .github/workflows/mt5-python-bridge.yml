@@ -1,0 +1,128 @@
+name: MT5 Python Bridge
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/mt5-python-bridge.yml"
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: mt5-python-bridge-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bridge:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    env:
+      MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
+      MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
+      MT5_SERVER: ${{ secrets.MT5_SERVER }}
+      MT5_TERMINAL_PATH: ${{ secrets.MT5_TERMINAL_PATH }}
+      SIGNALS_URL: ${{ secrets.SIGNALS_URL }}
+      SIGNALS_ACCESS_KEY: ${{ secrets.SIGNALS_ACCESS_KEY }}
+      SIGNALS_AUTH_HEADER: ${{ secrets.SIGNALS_AUTH_HEADER }}
+      MT5_SYMBOL_MAP: ${{ secrets.MT5_SYMBOL_MAP }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      DEMO_ONLY: "true"
+      ALLOW_DEMO_TRADING: "false"
+      RISK_PERCENT: "0.25"
+      POLL_SECONDS: "20"
+      MT5_MAGIC: "20261111"
+
+    steps:
+      - name: Checkout bridge
+        uses: actions/checkout@v4
+
+      - name: Validate required configuration
+        shell: pwsh
+        run: |
+          foreach ($name in @("MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER")) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Missing repository Actions secret: $name"
+            }
+          }
+          if ($env:DEMO_ONLY -ne "true" -or $env:ALLOW_DEMO_TRADING -ne "false") {
+            throw "Unsafe configuration. Workflow is locked to demo validation."
+          }
+
+      - name: Install and connect Tailscale (optional)
+        if: ${{ env.TAILSCALE_AUTHKEY != '' }}
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:TEMP "tailscale.msi"
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList @("/i", $msi, "/quiet", "/norestart") -Wait
+          $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) { throw "Tailscale installation failed" }
+          & $ts up "--authkey=$env:TAILSCALE_AUTHKEY" "--hostname=utfx-mt5-$env:GITHUB_RUN_ID" --accept-routes=false
+          $ip = & $ts ip -4
+          if (-not $ip) { throw "Tailscale did not assign an IPv4 address" }
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Tailscale connected. Private IP: $ip"
+
+      - name: Configure private RDP (optional)
+        if: ${{ env.TAILSCALE_AUTHKEY != '' && env.RDP_PASSWORD != '' }}
+        shell: pwsh
+        run: |
+          $secure = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $secure -PasswordNeverExpires
+          } else {
+            Set-LocalUser -Name "RDP" -Password $secure
+          }
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue | Disable-NetFirewallRule
+          New-NetFirewallRule -DisplayName "RDP only over Tailscale" -Direction Inbound -Protocol TCP -LocalPort 3389 -RemoteAddress "100.64.0.0/10" -Action Allow
+          Restart-Service TermService -Force
+          Write-Host "RDP enabled with NLA and restricted to Tailscale addresses. Password not printed."
+
+      - name: Set up supported Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Install MetaTrader 5 terminal
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:TEMP "mt5setup.exe"
+          Invoke-WebRequest "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
+          $target = Join-Path $env:ProgramFiles "MetaTrader 5"
+          Start-Process -FilePath $installer -ArgumentList "/auto", "/path:$target" -Wait
+          $terminal = Join-Path $target "terminal64.exe"
+          if (-not (Test-Path $terminal)) {
+            $terminal = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Filter terminal64.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $terminal) { throw "MT5 terminal installation could not be verified" }
+          "MT5_TERMINAL_PATH=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "MT5 terminal installed."
+
+      - name: Compile and run bridge (validation only)
+        shell: pwsh
+        run: |
+          python -m py_compile mt5_bridge.py
+          python mt5_bridge.py
+        timeout-minutes: 330
+
+      - name: Upload bridge journal
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt5-bridge-journal-${{ github.run_id }}
+          path: bridge_state.sqlite3
+          if-no-files-found: ignore
+          retention-days: 14
