@@ -16,7 +16,7 @@ concurrency:
 jobs:
   bridge:
     runs-on: windows-2022
-    timeout-minutes: 350
+    timeout-minutes: 20
     permissions:
       contents: read
     env:
@@ -111,12 +111,22 @@ jobs:
           "MT5_TERMINAL_PATH=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "MT5 terminal installed."
 
-      - name: Compile and run bridge (validation only)
+      - name: Compile bridge
+        shell: pwsh
+        run: python -m py_compile mt5_bridge.py
+
+      - name: Run signal bridge
+        if: ${{ env.SIGNALS_URL != '' && env.SIGNALS_ACCESS_KEY != '' }}
+        shell: pwsh
+        run: python mt5_bridge.py
+        timeout-minutes: 15
+
+      - name: Setup-only mode
+        if: ${{ env.SIGNALS_URL == '' || env.SIGNALS_ACCESS_KEY == '' }}
         shell: pwsh
         run: |
-          python -m py_compile mt5_bridge.py
-          python mt5_bridge.py
-        timeout-minutes: 330
+          Write-Host "Setup-only mode: Windows, Tailscale, RDP and MT5 installation checks completed."
+          Write-Host "Signal polling is skipped until SIGNALS_URL and SIGNALS_ACCESS_KEY are configured."
 
       - name: Upload bridge journal
         if: always()
