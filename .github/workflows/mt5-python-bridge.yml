@@ -149,6 +149,28 @@ jobs:
           "MT5_TERMINAL_PATH=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "MT5 terminal verified at: $terminal"
 
+      - name: Start MT5 terminal
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $terminal = $env:MT5_TERMINAL_PATH
+          if ([string]::IsNullOrWhiteSpace($terminal) -or -not (Test-Path $terminal)) {
+            throw "MT5 terminal executable not found: $terminal"
+          }
+
+          # Start the same terminal installation that the Python bridge will attach to.
+          $existing = Get-Process terminal64 -ErrorAction SilentlyContinue
+          if (-not $existing) {
+            Start-Process -FilePath $terminal -ArgumentList "/portable"
+          }
+          Start-Sleep -Seconds 15
+
+          $running = Get-Process terminal64 -ErrorAction SilentlyContinue
+          if (-not $running) {
+            throw "MT5 terminal process failed to start."
+          }
+          Write-Host "MT5 terminal process is running. Proceeding to Python IPC/demo login validation."
+
       - name: Verify backend MT5 demo login and IPC (no orders)
         shell: pwsh
         run: python demo_gold_limit.py
