@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/mt5-python-bridge.yml"
+      - "demo_gold_limit.py"
   schedule:
     - cron: "0 */6 * * *"
 
