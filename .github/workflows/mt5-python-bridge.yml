@@ -16,7 +16,7 @@ concurrency:
 jobs:
   bridge:
     runs-on: windows-2022
-    timeout-minutes: 20
+    timeout-minutes: 35
     permissions:
       contents: read
     env:
@@ -147,6 +147,13 @@ jobs:
         run: |
           Write-Host "Setup-only mode: Windows, Tailscale, RDP and MT5 installation checks completed."
           Write-Host "Signal polling is skipped until SIGNALS_URL and SIGNALS_ACCESS_KEY are configured."
+
+      - name: Keep RDP session available briefly
+        if: ${{ always() && env.TAILSCALE_AUTHKEY != '' && env.RDP_PASSWORD != '' }}
+        shell: pwsh
+        run: |
+          Write-Host "RDP is available over Tailscale for 15 minutes. Connect now."
+          Start-Sleep -Seconds 900
 
       - name: Upload bridge journal
         if: always()
