@@ -99,17 +99,37 @@ jobs:
       - name: Install MetaTrader 5 terminal
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $installer = Join-Path $env:TEMP "mt5setup.exe"
           Invoke-WebRequest "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
-          $target = Join-Path $env:ProgramFiles "MetaTrader 5"
-          Start-Process -FilePath $installer -ArgumentList "/auto", "/path:$target" -Wait
+          if ((Get-Item $installer).Length -lt 1000000) { throw "MetaTrader installer download is unexpectedly small" }
+
+          # Use a path without spaces so the web installer receives /path as one argument.
+          $target = "C:\MT5"
+          New-Item -ItemType Directory -Path $target -Force | Out-Null
+          $process = Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait -PassThru
+          Write-Host "MetaTrader installer process exited with code $($process.ExitCode)"
+
           $terminal = Join-Path $target "terminal64.exe"
           if (-not (Test-Path $terminal)) {
-            $terminal = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Filter terminal64.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+            $candidates = @(
+              "$env:ProgramFiles\MetaTrader 5\terminal64.exe",
+              "${env:ProgramFiles(x86)}\MetaTrader 5\terminal64.exe",
+              "$env:APPDATA\MetaQuotes\Terminal\terminal64.exe"
+            )
+            $terminal = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
           }
-          if (-not $terminal) { throw "MT5 terminal installation could not be verified" }
+          if (-not $terminal) {
+            $terminal = Get-ChildItem -Path @("C:\MT5", "$env:ProgramFiles\MetaTrader 5", "${env:ProgramFiles(x86)}\MetaTrader 5") -Filter terminal64.exe -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $terminal) {
+            Write-Host "Installer exit code: $($process.ExitCode)"
+            Write-Host "MT5 install directory contents:"
+            Get-ChildItem -Path "C:\MT5" -Force -ErrorAction SilentlyContinue | Select-Object Name, Length
+            throw "MT5 terminal installation could not be verified after automatic installation"
+          }
           "MT5_TERMINAL_PATH=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "MT5 terminal installed."
+          Write-Host "MT5 terminal verified at: $terminal"
 
       - name: Compile bridge
         shell: pwsh
