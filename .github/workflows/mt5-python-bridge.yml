@@ -132,7 +132,7 @@ jobs:
           "MT5_TERMINAL_PATH=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "MT5 terminal verified at: $terminal"
 
-      - name: Place fixed demo gold Buy Limit (duplicate-protected)
+      - name: Verify backend MT5 demo login and IPC (no orders)
         shell: pwsh
         run: python demo_gold_limit.py
 
