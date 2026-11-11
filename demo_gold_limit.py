@@ -1,5 +1,6 @@
 """One-time, fixed-parameter demo-only XAUUSD Buy Limit validation/order."""
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 import MetaTrader5 as mt5
@@ -14,21 +15,47 @@ VOLUME = 0.01
 MAGIC = 2026111101
 COMMENT = "UTFX-DEMO-GOLD-4000"
 
-# This fixed test is intentionally limited to workflow run #6 only.
-if os.getenv("GITHUB_RUN_NUMBER") != "6":
-    print("One-shot demo order test is disabled outside workflow run #6.")
+# This retry is limited to workflow run #7 only.
+if os.getenv("GITHUB_RUN_NUMBER") != "7":
+    print("One-shot demo order test is disabled outside workflow run #7.")
     raise SystemExit(0)
+
 
 def stop(message):
     print("DEMO GOLD ORDER NOT PLACED: " + message)
     raise SystemExit(0)
 
-kwargs = {"login": LOGIN, "password": PASSWORD, "server": SERVER, "timeout": 60000}
-ok = mt5.initialize(TERMINAL, **kwargs) if TERMINAL else mt5.initialize(**kwargs)
-if not ok:
-    stop(f"MT5 initialize/login failed: {mt5.last_error()}")
+
+if not TERMINAL or not os.path.isfile(TERMINAL):
+    stop("MT5 terminal executable path is missing or invalid.")
+
+# Start the terminal first, then attach the Python integration to its IPC endpoint.
+# Credentials are supplied through mt5.login(), not command-line arguments.
+try:
+    import subprocess
+    subprocess.Popen([TERMINAL, "/portable"], close_fds=True)
+except Exception as exc:
+    stop(f"Could not start MT5 terminal: {type(exc).__name__}: {exc}")
+
+time.sleep(25)
+initialized = False
+last_error = None
+for attempt in range(1, 4):
+    initialized = mt5.initialize(path=TERMINAL, timeout=120000)
+    if initialized:
+        break
+    last_error = mt5.last_error()
+    mt5.shutdown()
+    print(f"MT5 IPC attach attempt {attempt}/3 failed: {last_error}")
+    time.sleep(12)
+
+if not initialized:
+    stop(f"MT5 initialize/IPC failed after retries: {last_error}")
 
 try:
+    if not mt5.login(LOGIN, password=PASSWORD, server=SERVER, timeout=60000):
+        stop(f"MT5 login failed: {mt5.last_error()}")
+
     account = mt5.account_info()
     if account is None:
         stop("Could not read MT5 account details.")
@@ -56,8 +83,7 @@ try:
     if float(tick.ask) <= ENTRY:
         stop(f"Buy Limit requires Ask above {ENTRY}; current Ask is {tick.ask}. No order sent.")
 
-    # Idempotency: do not create another order if this exact test order exists
-    # as an active pending order or in the broker's recent order history.
+    # Idempotency: do not create another order if this exact test order exists.
     active = list(mt5.orders_get(symbol=symbol) or ())
     if any(getattr(o, "magic", 0) == MAGIC and getattr(o, "comment", "") == COMMENT for o in active):
         print("Matching demo pending order already exists; no duplicate sent.")
