@@ -14,6 +14,11 @@ VOLUME = 0.01
 MAGIC = 2026111101
 COMMENT = "UTFX-DEMO-GOLD-4000"
 
+# This fixed test is intentionally limited to workflow run #6 only.
+if os.getenv("GITHUB_RUN_NUMBER") != "6":
+    print("One-shot demo order test is disabled outside workflow run #6.")
+    raise SystemExit(0)
+
 def stop(message):
     print("DEMO GOLD ORDER NOT PLACED: " + message)
     raise SystemExit(0)
