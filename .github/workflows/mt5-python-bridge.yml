@@ -23,7 +23,7 @@ jobs:
     env:
       MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
       MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
-      MT5_SERVER: Deriv-Demo
+      MT5_SERVER: ${{ secrets.MT5_SERVER }}
       MT5_TERMINAL_PATH: ${{ secrets.MT5_TERMINAL_PATH }}
       SIGNALS_URL: ${{ secrets.SIGNALS_URL }}
       SIGNALS_ACCESS_KEY: ${{ secrets.SIGNALS_ACCESS_KEY }}
@@ -50,7 +50,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          python -m py_compile demo_gold_limit.py mt5_bridge.py
+          python -m py_compile demo_gold_limit.py demo_gold_test_order.py mt5_bridge.py
           $loginScript = Get-Content "demo_gold_limit.py" -Raw
           if ($loginScript -notmatch "mt5\.initialize\(" -or
               $loginScript -notmatch "login=LOGIN" -or
@@ -149,57 +149,72 @@ jobs:
           "MT5_TERMINAL_PATH=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "MT5 terminal verified at: $terminal"
 
-      - name: Start MT5 terminal
+      - name: Start MT5 with login configuration
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $terminal = $env:MT5_TERMINAL_PATH
-          if ([string]::IsNullOrWhiteSpace($terminal) -or -not (Test-Path $terminal)) {
-            throw "MT5 terminal executable not found: $terminal"
+          $ini = Join-Path $env:RUNNER_TEMP "mt5.ini"
+          try {
+            foreach ($n in "MT5_LOGIN","MT5_PASSWORD","MT5_SERVER") {
+              if (-not (Get-Item "env:$n" -ErrorAction SilentlyContinue).Value) { throw "$n is empty" }
+            }
+            if (-not (Test-Path -LiteralPath $terminal)) { throw "MT5 terminal not found: $terminal" }
+
+            Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep -Seconds 2
+
+            "[Common]`nLogin=$env:MT5_LOGIN`nPassword=$env:MT5_PASSWORD`nServer=$env:MT5_SERVER" |
+              Out-File $ini -Encoding ascii
+
+            Start-Process -FilePath $terminal -ArgumentList "/config:$ini"
+            Start-Sleep -Seconds 75
+          }
+          finally {
+            Remove-Item $ini -Force -ErrorAction SilentlyContinue
           }
 
-          # Start the same terminal installation that the Python bridge will attach to.
-          $existing = Get-Process terminal64 -ErrorAction SilentlyContinue
-          if (-not $existing) {
-            Start-Process -FilePath $terminal -ArgumentList "/portable"
-          }
-          Start-Sleep -Seconds 15
+          if (-not (Get-Process terminal64 -ErrorAction SilentlyContinue)) { throw "MT5 exited" }
 
-          $running = Get-Process terminal64 -ErrorAction SilentlyContinue
-          if (-not $running) {
-            throw "MT5 terminal process failed to start."
+          $logDirs = @("$(Split-Path $terminal)\logs") +
+            (Get-ChildItem "$env:APPDATA\MetaQuotes\Terminal\*\logs" -Directory -ErrorAction SilentlyContinue).FullName
+          foreach ($d in $logDirs) {
+            Write-Host "== $d"
+            Get-ChildItem "$d\*.log" -ErrorAction SilentlyContinue | ForEach-Object {
+              Get-Content $_ -Encoding Unicode |
+                Select-String "authorized|invalid|failed|login" | Select-Object -Last 15
+            }
           }
-          Write-Host "MT5 terminal process is running. Proceeding to Python IPC/demo login validation."
 
-      - name: Diagnose MT5 process and Python IPC
+      - name: Diagnose MT5 process
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           Write-Host "Configured terminal path: $env:MT5_TERMINAL_PATH"
-          Write-Host "Configured terminal exists:"
-          Test-Path -LiteralPath $env:MT5_TERMINAL_PATH
-          Write-Host "Suggested Program Files path exists:"
-          Test-Path "C:\Program Files\MetaTrader 5\terminal64.exe"
-          Write-Host "Running terminal process details:"
           $mt5 = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue
           if ($mt5) {
-            $mt5 | Select-Object ProcessId, ExecutablePath, CommandLine | Format-List
+            $mt5 | Select-Object ProcessId, ExecutablePath | Format-List
           } else {
-            Write-Host "NO terminal64.exe PROCESS FOUND"
+            throw "NO terminal64.exe PROCESS FOUND"
           }
-          Write-Host "Python package version and direct IPC probe:"
-          python -c "import os, MetaTrader5 as m; p=os.environ['MT5_TERMINAL_PATH']; print('package_version=',m.__version__); print('path=',p); ok=m.initialize(path=p, timeout=60000); print('initialize=',ok); print('last_error=',m.last_error()); m.shutdown() if ok else None"
 
       - name: Verify backend MT5 demo login and IPC (no orders)
         shell: pwsh
         run: python demo_gold_limit.py
+
+      - name: Place one guarded demo gold BUY LIMIT with SL and TP
+        if: ${{ github.event_name == 'push' && github.event.head_commit.message == 'test: one demo gold limit order' }}
+        shell: pwsh
+        env:
+          ALLOW_DEMO_TRADING: "true"
+        run: python demo_gold_test_order.py
 
       - name: Compile bridge
         shell: pwsh
         run: python -m py_compile mt5_bridge.py demo_gold_limit.py
 
       - name: Run signal bridge
-        if: ${{ env.SIGNALS_URL != '' && env.SIGNALS_ACCESS_KEY != '' }}
+        if: ${{ env.SIGNALS_URL != '' && env.SIGNALS_ACCESS_KEY != '' && !(github.event_name == 'push' && github.event.head_commit.message == 'test: one demo gold limit order') }}
         shell: pwsh
         run: python mt5_bridge.py
         timeout-minutes: 15
