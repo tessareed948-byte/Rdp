@@ -23,7 +23,7 @@ jobs:
     env:
       MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
       MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
-      MT5_SERVER: ${{ secrets.MT5_SERVER }}
+      MT5_SERVER: Deriv-Demo
       MT5_TERMINAL_PATH: ${{ secrets.MT5_TERMINAL_PATH }}
       SIGNALS_URL: ${{ secrets.SIGNALS_URL }}
       SIGNALS_ACCESS_KEY: ${{ secrets.SIGNALS_ACCESS_KEY }}
