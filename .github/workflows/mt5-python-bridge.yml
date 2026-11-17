@@ -17,7 +17,7 @@ concurrency:
 jobs:
   bridge:
     runs-on: windows-2022
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
     env:
@@ -53,10 +53,10 @@ jobs:
           python -m py_compile demo_gold_limit.py demo_gold_test_order.py mt5_bridge.py
           $loginScript = Get-Content "demo_gold_limit.py" -Raw
           if ($loginScript -notmatch "mt5\.initialize\(" -or
-              $loginScript -notmatch "login=LOGIN" -or
+              $loginScript -notmatch "mt5\.login\(" -or
               $loginScript -notmatch "password=PASSWORD" -or
               $loginScript -notmatch "server=SERVER") {
-            throw "Preflight failed: backend login parameters are incomplete."
+            throw "Preflight failed: terminal initialization and explicit broker login are required."
           }
           if ($loginScript -match "order_send\(") {
             throw "Preflight failed: login-only test must not contain order submission."
@@ -148,6 +148,47 @@ jobs:
           }
           "MT5_TERMINAL_PATH=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "MT5 terminal verified at: $terminal"
+
+      - name: Start MT5 terminal and allow first-run broker synchronization
+        shell: pwsh
+        env:
+          MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
+          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $terminal = $env:MT5_TERMINAL_PATH
+          if (-not (Test-Path -LiteralPath $terminal)) {
+            throw "MT5 terminal executable not found: $terminal"
+          }
+
+          # Keep credentials in a runner-local config file; never print its contents.
+          $ini = Join-Path $env:RUNNER_TEMP "mt5-demo-startup.ini"
+          @(
+            "[Common]"
+            "Login=$env:MT5_LOGIN"
+            "Password=$env:MT5_PASSWORD"
+            "Server=$env:MT5_SERVER"
+          ) | Set-Content -LiteralPath $ini -Encoding ASCII
+
+          $existing = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -eq $terminal }
+          if (-not $existing) {
+            $args = '/config:"' + $ini + '"'
+            $proc = Start-Process -FilePath $terminal -ArgumentList $args -PassThru
+            Write-Host "Started MT5 terminal process ID $($proc.Id). Waiting for first-run broker/server synchronization."
+          } else {
+            Write-Host "Matching MT5 terminal process already exists; allowing it to finish startup."
+          }
+
+          Start-Sleep -Seconds 90
+          $running = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -eq $terminal }
+          if (-not $running) {
+            throw "MT5 terminal exited during startup; inspect terminal installation/startup logs."
+          }
+          Write-Host "MT5 terminal is running after startup wait. Credentials are not logged."
+          Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
 
       - name: Initialize MT5 through the Python bridge
         shell: pwsh
