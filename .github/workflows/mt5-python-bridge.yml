@@ -149,42 +149,14 @@ jobs:
           "MT5_TERMINAL_PATH=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "MT5 terminal verified at: $terminal"
 
-      - name: Start MT5 with login configuration
+      - name: Initialize MT5 through the Python bridge
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $terminal = $env:MT5_TERMINAL_PATH
-          $ini = Join-Path $env:RUNNER_TEMP "mt5.ini"
-          try {
-            foreach ($n in "MT5_LOGIN","MT5_PASSWORD","MT5_SERVER") {
-              if (-not (Get-Item "env:$n" -ErrorAction SilentlyContinue).Value) { throw "$n is empty" }
-            }
-            if (-not (Test-Path -LiteralPath $terminal)) { throw "MT5 terminal not found: $terminal" }
-
-            Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
-            Start-Sleep -Seconds 2
-
-            "[Common]`nLogin=$env:MT5_LOGIN`nPassword=$env:MT5_PASSWORD`nServer=$env:MT5_SERVER" |
-              Out-File $ini -Encoding ascii
-
-            Start-Process -FilePath $terminal -ArgumentList "/config:$ini"
-            Start-Sleep -Seconds 75
+          if (-not (Test-Path -LiteralPath $env:MT5_TERMINAL_PATH)) {
+            throw "MT5 terminal executable not found: $env:MT5_TERMINAL_PATH"
           }
-          finally {
-            Remove-Item $ini -Force -ErrorAction SilentlyContinue
-          }
-
-          if (-not (Get-Process terminal64 -ErrorAction SilentlyContinue)) { throw "MT5 exited" }
-
-          $logDirs = @("$(Split-Path $terminal)\logs") +
-            (Get-ChildItem "$env:APPDATA\MetaQuotes\Terminal\*\logs" -Directory -ErrorAction SilentlyContinue).FullName
-          foreach ($d in $logDirs) {
-            Write-Host "== $d"
-            Get-ChildItem "$d\*.log" -ErrorAction SilentlyContinue | ForEach-Object {
-              Get-Content $_ -Encoding Unicode |
-                Select-String "authorized|invalid|failed|login" | Select-Object -Last 15
-            }
-          }
+          Write-Host "MT5 terminal installation verified. The MetaTrader5 Python package will start/attach and authenticate using the configured demo credentials in the next step."
 
       - name: Diagnose MT5 process
         shell: pwsh
