@@ -158,16 +158,19 @@ jobs:
           }
           Write-Host "MT5 terminal installation verified. The MetaTrader5 Python package will start/attach and authenticate using the configured demo credentials in the next step."
 
-      - name: Diagnose MT5 process
+      - name: Check MT5 terminal before Python initialization
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          Write-Host "Configured terminal path: $env:MT5_TERMINAL_PATH"
+          if (-not (Test-Path -LiteralPath $env:MT5_TERMINAL_PATH)) {
+            throw "MT5 terminal executable not found: $env:MT5_TERMINAL_PATH"
+          }
           $mt5 = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue
           if ($mt5) {
             $mt5 | Select-Object ProcessId, ExecutablePath | Format-List
+            Write-Host "Existing MT5 process found; Python bridge will attach and authenticate."
           } else {
-            throw "NO terminal64.exe PROCESS FOUND"
+            Write-Host "No MT5 process exists yet. This is expected: demo_gold_limit.py will launch the terminal through mt5.initialize(path=...)."
           }
 
       - name: Verify backend MT5 demo login and IPC (no orders)
