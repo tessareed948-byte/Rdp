@@ -149,8 +149,8 @@ jobs:
           "MT5_TERMINAL_PATH=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "MT5 terminal verified at: $terminal"
 
-      - name: Start MT5 terminal and allow first-run broker synchronization
-        shell: pwsh
+      - name: Start MT5 terminal
+        shell: powershell
         env:
           MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
           MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
@@ -162,33 +162,44 @@ jobs:
             throw "MT5 terminal executable not found: $terminal"
           }
 
-          # Keep credentials in a runner-local config file; never print its contents.
+          # Portable mode keeps this runner's terminal data/logs beside the installed binary.
+          # The config contains demo credentials only and explicitly keeps live trading disabled.
           $ini = Join-Path $env:RUNNER_TEMP "mt5-demo-startup.ini"
           @(
             "[Common]"
             "Login=$env:MT5_LOGIN"
             "Password=$env:MT5_PASSWORD"
             "Server=$env:MT5_SERVER"
+            "[Experts]"
+            "Enabled=1"
+            "AllowLiveTrading=0"
           ) | Set-Content -LiteralPath $ini -Encoding ASCII
 
           $existing = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.ExecutablePath -eq $terminal }
           if (-not $existing) {
-            $args = '/config:"' + $ini + '"'
-            $proc = Start-Process -FilePath $terminal -ArgumentList $args -PassThru
-            Write-Host "Started MT5 terminal process ID $($proc.Id). Waiting for first-run broker/server synchronization."
+            $proc = Start-Process -FilePath $terminal -ArgumentList @("/portable", "/config:$ini") -PassThru
+            Write-Host "Started portable MT5 terminal process ID $($proc.Id)."
           } else {
-            Write-Host "Matching MT5 terminal process already exists; allowing it to finish startup."
+            Write-Host "Matching MT5 terminal process already exists."
           }
 
-          Start-Sleep -Seconds 90
-          $running = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.ExecutablePath -eq $terminal }
-          if (-not $running) {
-            throw "MT5 terminal exited during startup; inspect terminal installation/startup logs."
+          $running = $null
+          for ($i = 0; $i -lt 24; $i++) {
+            Start-Sleep -Seconds 5
+            $running = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { $_.ExecutablePath -eq $terminal }
+            if ($running) {
+              Write-Host "MT5 terminal running; process ID(s): $($running.ProcessId -join ', ')"
+              break
+            }
           }
-          Write-Host "MT5 terminal is running after startup wait. Credentials are not logged."
+          if (-not $running) {
+            throw "MT5 terminal did not remain running after 120 seconds."
+          }
+          Start-Sleep -Seconds 60
           Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
+          Write-Host "Portable MT5 startup wait completed. Live trading remains disabled."
 
       - name: Initialize MT5 through the Python bridge
         shell: pwsh
@@ -199,20 +210,33 @@ jobs:
           }
           Write-Host "MT5 terminal installation verified. The MetaTrader5 Python package will start/attach and authenticate using the configured demo credentials in the next step."
 
-      - name: Check MT5 terminal before Python initialization
-        shell: pwsh
+      - name: MT5 diagnostics
+        shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
-          if (-not (Test-Path -LiteralPath $env:MT5_TERMINAL_PATH)) {
-            throw "MT5 terminal executable not found: $env:MT5_TERMINAL_PATH"
+          $ErrorActionPreference = "Continue"
+          Write-Host "Configured terminal path: $env:MT5_TERMINAL_PATH"
+          if ($env:MT5_TERMINAL_PATH) {
+            Get-Item -LiteralPath $env:MT5_TERMINAL_PATH -ErrorAction SilentlyContinue | Select-Object FullName, Length, LastWriteTime
           }
-          $mt5 = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue
-          if ($mt5) {
-            $mt5 | Select-Object ProcessId, ExecutablePath | Format-List
-            Write-Host "Existing MT5 process found; Python bridge will attach and authenticate."
-          } else {
-            Write-Host "No MT5 process exists yet. This is expected: demo_gold_limit.py will launch the terminal through mt5.initialize(path=...)."
+          Write-Host "terminal64.exe processes:"
+          Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
+            Select-Object ProcessId, SessionId, ExecutablePath, CommandLine | Format-List
+
+          $logRoots = @(
+            "$env:APPDATA\MetaQuotes\Terminal",
+            (Join-Path (Split-Path -Parent $env:MT5_TERMINAL_PATH) "MQL5\Logs")
+          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+          foreach ($root in $logRoots) {
+            Write-Host "Recent MT5 logs under: $root"
+            Get-ChildItem -LiteralPath $root -Recurse -Filter *.log -File -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 5 |
+              ForEach-Object {
+                Write-Host "---- $($_.FullName) ----"
+                Get-Content -LiteralPath $_.FullName -Tail 20 -ErrorAction SilentlyContinue
+              }
           }
+          Write-Host "Diagnostics complete; secrets are not printed."
+
 
       - name: Verify backend MT5 demo login and IPC (no orders)
         shell: pwsh
