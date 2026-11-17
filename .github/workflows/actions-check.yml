@@ -1,0 +1,23 @@
+name: Actions check
+
+# Minimal test: does GitHub create jobs for this repo at all?
+# Runs automatically on push to the actions-check branch.
+on:
+  push:
+    branches: [actions-check]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo "Linux job started OK"
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "Windows job started OK"
+          python --version
