@@ -11,16 +11,30 @@ TERMINAL = os.getenv("MT5_TERMINAL_PATH", "").strip()
 if not TERMINAL or not os.path.isfile(TERMINAL):
     raise RuntimeError(f"MT5 terminal executable path is missing or invalid: {TERMINAL!r}")
 
-# Attach to the exact terminal executable started by the workflow. Do not
-# shutdown/reinitialize between login retries: that can detach from the GUI
-# terminal and recreate the IPC timeout we are diagnosing.
-initialized = mt5.initialize(path=TERMINAL, timeout=120000)
+# The workflow starts the terminal with /portable, so its data folder lives next
+# to terminal64.exe. The Python package must be told the same (portable=True),
+# otherwise it looks for the terminal's data folder under %APPDATA% and fails
+# with (-10005, 'IPC timeout'). Do not shutdown/reinitialize between retries:
+# that can detach from the running terminal.
+initialized = False
+init_error = None
+for init_attempt in range(1, 6):
+    initialized = mt5.initialize(path=TERMINAL, portable=True, timeout=120000)
+    if initialized:
+        break
+    init_error = mt5.last_error()
+    print(f"MT5 initialize attempt {init_attempt}/5 failed: {init_error}")
+    time.sleep(20)
+
 if not initialized:
-    error = mt5.last_error()
     raise RuntimeError(
-        f"MT5 initialize/IPC failed for {TERMINAL!r}: {error}. "
+        f"MT5 initialize/IPC failed for {TERMINAL!r}: {init_error}. "
         "Inspect the preceding MT5 diagnostics and terminal logs."
     )
+
+info = mt5.terminal_info()
+if info is not None:
+    print(f"Attached to terminal: path={info.path}; data_path={info.data_path}; connected={info.connected}")
 
 last_error = None
 connected = False
