@@ -175,7 +175,8 @@ jobs:
         run: python demo_gold_limit.py
 
       - name: Place one guarded demo gold BUY LIMIT with SL and TP
-        if: ${{ github.event_name == 'push' && github.event.head_commit.message == 'test: one demo gold limit order' }}
+        if: >-
+          ${{ github.event_name == 'push' && github.event.head_commit.message == 'test: one demo gold limit order' }}
         shell: pwsh
         env:
           ALLOW_DEMO_TRADING: "true"
@@ -186,7 +187,8 @@ jobs:
         run: python -m py_compile mt5_bridge.py demo_gold_limit.py
 
       - name: Run signal bridge
-        if: ${{ env.SIGNALS_URL != '' && env.SIGNALS_ACCESS_KEY != '' && !(github.event_name == 'push' && github.event.head_commit.message == 'test: one demo gold limit order') }}
+        if: >-
+          ${{ env.SIGNALS_URL != '' && env.SIGNALS_ACCESS_KEY != '' && !(github.event_name == 'push' && github.event.head_commit.message == 'test: one demo gold limit order') }}
         shell: pwsh
         run: python mt5_bridge.py
         timeout-minutes: 15
