@@ -1,0 +1,93 @@
+name: MT5 Python Demo Trade
+
+# Installs the Deriv MT5 terminal, connects to the demo account, then places ONE
+# demo market order from Python. The script refuses to trade on a non-demo account.
+# Runs automatically on every push to the mt5-python-trade branch, or by hand.
+on:
+  push:
+    branches: [mt5-python-trade]
+  workflow_dispatch:
+
+jobs:
+  python-trade:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install MetaTrader5==5.0.6231
+          python -m pip show MetaTrader5
+
+      - name: Install Deriv MetaTrader 5
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:TEMP "deriv5setup.exe"
+          Invoke-WebRequest "https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe" -OutFile $installer
+          New-Item -ItemType Directory -Path "C:\MT5" -Force | Out-Null
+          Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait
+          if (-not (Test-Path "C:\MT5\terminal64.exe")) { throw "terminal64.exe not found in C:\MT5" }
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
+
+      - name: Connect and place the demo trade
+        shell: pwsh
+        env:
+          MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
+          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+          MT5_TERMINAL_PATH: 'C:\MT5\terminal64.exe'
+          TRADE_SYMBOL: "XAUUSD.0"
+          TRADE_LOTS: "0.01"
+          TRADE_SIDE: "buy"
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          function Get-SyncCount {
+            $f = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $f) { return 0 }
+            return @(Get-Content -LiteralPath $f.FullName | Select-String -Pattern "terminal synchronized with").Count
+          }
+
+          # Algorithmic trading must be switched on, otherwise the terminal rejects API orders.
+          $ini = "C:\mt5_login.ini"
+          @(
+            "[Common]"
+            "Login=$env:MT5_LOGIN"
+            "Password=$env:MT5_PASSWORD"
+            "Server=$env:MT5_SERVER"
+            "[Experts]"
+            "Enabled=1"
+            "AllowLiveTrading=1"
+          ) | Set-Content -LiteralPath $ini -Encoding ASCII
+
+          $before = Get-SyncCount
+          $proc = Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList @("/portable", "/config:$ini") -PassThru
+          Write-Host "Terminal started. PID=$($proc.Id)"
+          for ($i = 1; $i -le 30; $i++) {
+            Start-Sleep -Seconds 5
+            if ((Get-SyncCount) -gt $before) {
+              Write-Host "Terminal synchronized after $($i * 5) seconds"
+              break
+            }
+          }
+          Start-Sleep -Seconds 10
+
+          Write-Host "===== PLACING THE DEMO TRADE FROM PYTHON ====="
+          python mt5_demo_trade.py
+          $code = $LASTEXITCODE
+
+          Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
+          if ($code -ne 0) {
+            Write-Host "RESULT: trade was not placed (exit code $code)"
+            exit 1
+          }
+          Write-Host "RESULT: demo trade placed from Python"
