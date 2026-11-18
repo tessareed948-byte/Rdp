@@ -1,7 +1,8 @@
 name: MT5 EA Auto Trade
 
-# Installs MT5, compiles an Expert Advisor, starts the terminal with the EA attached,
-# and waits for the EA to place one DEMO trade. No Python MT5 package is involved.
+# Installs the Deriv MT5 terminal (so the Deriv server list is built in), compiles an
+# Expert Advisor, starts the terminal with the EA attached, and waits for the EA to
+# place one DEMO trade. No Python MT5 package is involved.
 # Runs automatically on every push to the mt5-ea-trade branch.
 on:
   push:
@@ -17,14 +18,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install MetaTrader 5
+      - name: Install Deriv MetaTrader 5
         shell: pwsh
         run: |
-          $installer = Join-Path $env:TEMP "mt5setup.exe"
-          Invoke-WebRequest "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
+          $installer = Join-Path $env:TEMP "deriv5setup.exe"
+          Invoke-WebRequest "https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe" -OutFile $installer
+          Write-Host "Installer size in bytes: $((Get-Item $installer).Length)"
           New-Item -ItemType Directory -Path "C:\MT5" -Force | Out-Null
           Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait
-          if (-not (Test-Path "C:\MT5\terminal64.exe")) { throw "terminal64.exe not found in C:\MT5" }
+          if (-not (Test-Path "C:\MT5\terminal64.exe")) {
+            Write-Host "Contents of C:\MT5:"
+            Get-ChildItem "C:\MT5" -ErrorAction SilentlyContinue | Select-Object Name
+            throw "terminal64.exe not found in C:\MT5"
+          }
           Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
 
       - name: Compile the Expert Advisor
@@ -88,9 +94,17 @@ jobs:
             Write-Host "Waiting for the EA result after $($i * 10) seconds"
           }
 
-          Write-Host "===== EXPERT LOG, LAST 40 LINES ====="
+          Write-Host "===== EXPERT LOG, LAST 15 LINES ====="
           $log = Get-ChildItem -Path "C:\MT5\MQL5\Logs" -Filter "*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if ($log) { Get-Content -LiteralPath $log.FullName -Tail 40 } else { Write-Host "No expert log found" }
+          if ($log) { Get-Content -LiteralPath $log.FullName -Tail 15 } else { Write-Host "No expert log found" }
+
+          Write-Host "===== TERMINAL LOG, NETWORK AND LOGIN LINES ====="
+          $tlog = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($tlog) {
+            Get-Content -LiteralPath $tlog.FullName | Select-String -Pattern "Network|authoriz|login|server" | Select-Object -Last 20 | ForEach-Object { Write-Host $_.Line }
+          } else {
+            Write-Host "No terminal log found"
+          }
 
           Write-Host "===== TERMINAL PROCESS ====="
           Get-Process terminal64 -ErrorAction SilentlyContinue | Select-Object Id, SessionId, Responding, MainWindowTitle | Format-List
