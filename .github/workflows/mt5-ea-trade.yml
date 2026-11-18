@@ -1,8 +1,9 @@
 name: MT5 EA Auto Trade
 
 # Installs the Deriv MT5 terminal (so the Deriv server list is built in), compiles an
-# Expert Advisor, starts the terminal with the EA attached, and waits for the EA to
-# place one DEMO trade. No Python MT5 package is involved.
+# Expert Advisor, connects once so the symbol list is cached, then starts the terminal
+# with the EA attached and waits for the EA to place one DEMO trade.
+# No Python MT5 package is involved.
 # Runs automatically on every push to the mt5-ea-trade branch.
 on:
   push:
@@ -54,7 +55,7 @@ jobs:
           if (-not (Test-Path "$dest\DemoAutoTrade.ex5")) { throw "EA did not compile: DemoAutoTrade.ex5 not found" }
           Write-Host "EA compiled successfully"
 
-      - name: Start MT5 with the EA and wait for the demo trade
+      - name: Connect once, then start MT5 with the EA and wait for the demo trade
         shell: pwsh
         env:
           MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
@@ -62,6 +63,35 @@ jobs:
           MT5_SERVER: ${{ secrets.MT5_SERVER }}
         run: |
           $ErrorActionPreference = "Continue"
+
+          function Get-SyncCount {
+            $f = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $f) { return 0 }
+            return @(Get-Content -LiteralPath $f.FullName | Select-String -Pattern "terminal synchronized with").Count
+          }
+
+          # Phase 1: connect once so the broker's symbol list is cached on disk.
+          # A start-up chart cannot open for a symbol the terminal has not seen yet.
+          $loginIni = "C:\mt5_login.ini"
+          @("[Common]", "Login=$env:MT5_LOGIN", "Password=$env:MT5_PASSWORD", "Server=$env:MT5_SERVER") | Set-Content -LiteralPath $loginIni -Encoding ASCII
+          $before = Get-SyncCount
+          $first = Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList @("/portable", "/config:$loginIni") -PassThru
+          Write-Host "Phase 1: connecting once to cache symbols. PID=$($first.Id)"
+          for ($i = 1; $i -le 24; $i++) {
+            Start-Sleep -Seconds 5
+            if ((Get-SyncCount) -gt $before) {
+              Write-Host "Phase 1: terminal synchronized after $($i * 5) seconds"
+              break
+            }
+          }
+          Start-Sleep -Seconds 20
+          $null = $first.CloseMainWindow()
+          if (-not $first.WaitForExit(40000)) { Stop-Process -Id $first.Id -Force }
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 5
+          Remove-Item -LiteralPath $loginIni -Force -ErrorAction SilentlyContinue
+
+          # Phase 2: start again with the EA attached through the start-up config.
           $ini = "C:\mt5_ea.ini"
           @(
             "[Common]"
@@ -79,11 +109,11 @@ jobs:
           ) | Set-Content -LiteralPath $ini -Encoding ASCII
 
           $proc = Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList @("/portable", "/config:$ini") -PassThru
-          Write-Host "Started terminal PID=$($proc.Id)"
+          Write-Host "Phase 2: started terminal with the EA. PID=$($proc.Id)"
 
           $resultFile = "C:\MT5\MQL5\Files\trade_result.txt"
           $placed = $false
-          for ($i = 1; $i -le 30; $i++) {
+          for ($i = 1; $i -le 24; $i++) {
             Start-Sleep -Seconds 10
             if (Test-Path $resultFile) {
               $text = Get-Content -LiteralPath $resultFile -Raw
@@ -98,10 +128,10 @@ jobs:
           $log = Get-ChildItem -Path "C:\MT5\MQL5\Logs" -Filter "*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if ($log) { Get-Content -LiteralPath $log.FullName -Tail 15 } else { Write-Host "No expert log found" }
 
-          Write-Host "===== TERMINAL LOG, NETWORK AND LOGIN LINES ====="
+          Write-Host "===== TERMINAL LOG, NETWORK AND STARTUP LINES ====="
           $tlog = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if ($tlog) {
-            Get-Content -LiteralPath $tlog.FullName | Select-String -Pattern "Network|authoriz|login|server" | Select-Object -Last 20 | ForEach-Object { Write-Host $_.Line }
+            Get-Content -LiteralPath $tlog.FullName | Select-String -Pattern "Network|authoriz|synchronized|expert|chart|Startup" | Select-Object -Last 20 | ForEach-Object { Write-Host $_.Line }
           } else {
             Write-Host "No terminal log found"
           }
