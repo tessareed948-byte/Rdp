@@ -1,7 +1,8 @@
 name: MT5 Diagnose
 
-# Diagnostic only. Lets Python launch the MT5 terminal itself (no pre-start),
-# with the newest MetaTrader5 package. No orders are sent.
+# Diagnostic only. Installs the Deriv MT5 terminal (broker server list built in) and
+# tests whether the Python package can attach to it, both when the terminal is
+# already running and when Python launches it. No orders are sent.
 # Runs automatically on every push to the mt5-diagnose branch.
 on:
   push:
@@ -27,16 +28,17 @@ jobs:
           python -m pip install --upgrade MetaTrader5 requests
           python -m pip show MetaTrader5
 
-      - name: Install MetaTrader 5
+      - name: Install Deriv MetaTrader 5
         shell: pwsh
         run: |
-          $installer = Join-Path $env:TEMP "mt5setup.exe"
-          Invoke-WebRequest "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
+          $installer = Join-Path $env:TEMP "deriv5setup.exe"
+          Invoke-WebRequest "https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe" -OutFile $installer
           New-Item -ItemType Directory -Path "C:\MT5" -Force | Out-Null
           Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait
           if (-not (Test-Path "C:\MT5\terminal64.exe")) { throw "terminal64.exe not found in C:\MT5" }
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
 
-      - name: Let Python launch MT5 itself
+      - name: Test Python attach with the Deriv terminal
         shell: pwsh
         env:
           MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
@@ -45,45 +47,39 @@ jobs:
           MT5_TERMINAL_PATH: 'C:\MT5\terminal64.exe'
         run: |
           $ErrorActionPreference = "Continue"
-          Write-Host "Session id: $((Get-Process -Id $PID).SessionId); elevated token:"
-          whoami /groups | Select-String "High Mandatory"
 
-          try {
-            Set-MpPreference -DisableRealtimeMonitoring $true
-            Write-Host "Defender real-time monitoring disabled for this test"
-          } catch {
-            Write-Host "Could not change Defender settings: $_"
+          function Get-SyncCount {
+            $f = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $f) { return 0 }
+            return @(Get-Content -LiteralPath $f.FullName | Select-String -Pattern "terminal synchronized with").Count
           }
 
-          # Make sure nothing is running, so Python is the one that launches the terminal.
+          # Test A: start the terminal ourselves, wait until it has synchronized, then attach from Python.
+          $ini = "C:\mt5_login.ini"
+          @("[Common]", "Login=$env:MT5_LOGIN", "Password=$env:MT5_PASSWORD", "Server=$env:MT5_SERVER") | Set-Content -LiteralPath $ini -Encoding ASCII
+          $before = Get-SyncCount
+          $proc = Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList @("/portable", "/config:$ini") -PassThru
+          Write-Host "Test A: terminal started. PID=$($proc.Id)"
+          for ($i = 1; $i -le 24; $i++) {
+            Start-Sleep -Seconds 5
+            if ((Get-SyncCount) -gt $before) {
+              Write-Host "Test A: terminal synchronized after $($i * 5) seconds"
+              break
+            }
+          }
+          Start-Sleep -Seconds 10
+          Write-Host "===== TEST A: ATTACH TO A RUNNING, CONNECTED TERMINAL ====="
+          python mt5_probe.py
+
+          # Test B: no terminal running, Python launches it with the credentials.
           Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
           Start-Sleep -Seconds 5
-
-          Write-Host "===== PYTHON LAUNCH PROBE ====="
+          Write-Host "===== TEST B: PYTHON LAUNCHES THE TERMINAL ====="
           python mt5_probe_launch.py
 
-          Write-Host "===== NEWEST TERMINAL LOG, LAST 40 LINES ====="
-          $log = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if ($log) { Get-Content -LiteralPath $log.FullName -Tail 40 } else { Write-Host "No terminal log found" }
-
-          Write-Host "===== SCREENSHOT ====="
-          try {
-            Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-            $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
-            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
-            $g = [System.Drawing.Graphics]::FromImage($bmp)
-            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
-            $bmp.Save("$env:GITHUB_WORKSPACE\screen.png")
-            Write-Host "Screenshot saved"
-          } catch {
-            Write-Host "Screenshot failed: $_"
+          Write-Host "===== TERMINAL LOG, NETWORK LINES ====="
+          $tlog = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($tlog) {
+            Get-Content -LiteralPath $tlog.FullName | Select-String -Pattern "Network|authoriz|synchronized" | Select-Object -Last 12 | ForEach-Object { Write-Host $_.Line }
           }
-
-      - name: Upload diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mt5-diagnostics
-          path: screen.png
-          if-no-files-found: ignore
-          retention-days: 3
+          Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
