@@ -1,0 +1,168 @@
+"""Places ONE order from a signal on the connected MT5 account.
+
+All inputs arrive as environment variables set by the workflow, never as shell text.
+Safety rules enforced here:
+  * live (non-demo) accounts are refused unless ALLOW_LIVE=true
+  * lot size is capped by MAX_LOTS
+  * the order is skipped if the required margin does not fit the free margin
+  * a signal ID that was already traded (open position or recent deal) is skipped
+"""
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+
+import MetaTrader5 as mt5
+
+TERMINAL = os.environ["MT5_TERMINAL_PATH"]
+LOGIN = int(os.environ["MT5_LOGIN"])
+PASSWORD = os.environ["MT5_PASSWORD"]
+SERVER = os.environ["MT5_SERVER"]
+
+ALLOW_LIVE = os.getenv("ALLOW_LIVE", "false").strip().lower() == "true"
+MAX_LOTS = float(os.getenv("MAX_LOTS", "").strip() or "0.01")
+MAGIC = 20261118
+
+
+def summary(text):
+    path = os.getenv("GITHUB_STEP_SUMMARY")
+    if path:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(text + "\n\n")
+
+
+def done(code, message):
+    print(message)
+    summary(message)
+    mt5.shutdown()
+    sys.exit(code)
+
+
+def number(name, raw):
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        done(1, f"FAILED: {name} is not a number")
+
+
+symbol_in = os.getenv("SIG_SYMBOL", "").strip()
+side = os.getenv("SIG_SIDE", "").strip().lower()
+signal_id = os.getenv("SIG_ID", "").strip() or os.getenv("GITHUB_RUN_ID", "manual")
+
+if not re.fullmatch(r"[A-Za-z0-9._#+-]{1,24}", symbol_in):
+    done(1, "FAILED: invalid symbol")
+if side not in ("buy", "sell"):
+    done(1, "FAILED: side must be buy or sell")
+if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", signal_id):
+    done(1, "FAILED: signal_id may only contain letters, digits, dash and underscore (max 20)")
+
+lots = number("lots", os.getenv("SIG_LOTS"))
+lots = MAX_LOTS if lots is None else min(lots, MAX_LOTS)
+sl = number("sl", os.getenv("SIG_SL"))
+tp = number("tp", os.getenv("SIG_TP"))
+comment = f"sig-{signal_id}"[:31]
+
+print(f"Signal: {side} {symbol_in} lots<={lots} sl={sl} tp={tp} id={signal_id}")
+
+if not mt5.initialize(path=TERMINAL, portable=True, timeout=120000):
+    print("FAILED: initialize ->", mt5.last_error())
+    sys.exit(1)
+if not mt5.login(LOGIN, password=PASSWORD, server=SERVER):
+    done(1, f"FAILED: login -> {mt5.last_error()}")
+
+account = mt5.account_info()
+if account is None or account.login != LOGIN:
+    done(1, "FAILED: connected account does not match the configured login")
+
+is_demo = account.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO
+print(f"Account mode: {'DEMO' if is_demo else 'REAL'}; free margin {account.margin_free} {account.currency}")
+if not is_demo and not ALLOW_LIVE:
+    done(1, "SAFETY STOP: this is a real account and the repo variable ALLOW_LIVE is not 'true'")
+
+terminal = mt5.terminal_info()
+if not terminal.trade_allowed:
+    done(1, "FAILED: algorithmic trading is switched off in the terminal")
+
+# Resolve the symbol name (brokers add suffixes such as .0 or m).
+info = mt5.symbol_info(symbol_in)
+if info is None:
+    base = re.sub(r"[^A-Za-z0-9]", "", symbol_in)[:6]
+    candidates = [s.name for s in (mt5.symbols_get(f"*{base}*") or [])]
+    if not candidates:
+        done(1, f"FAILED: symbol {symbol_in} not found on this server")
+    symbol = candidates[0]
+    info = mt5.symbol_info(symbol)
+    print(f"Symbol {symbol_in} not found, using {symbol}")
+else:
+    symbol = symbol_in
+if not mt5.symbol_select(symbol, True):
+    done(1, f"FAILED: could not select {symbol}: {mt5.last_error()}")
+
+# Never trade the same signal twice.
+open_match = [p for p in (mt5.positions_get() or []) if comment in (p.comment or "")]
+now = datetime.now(timezone.utc)
+deals = mt5.history_deals_get(now - timedelta(days=3), now + timedelta(days=1)) or []
+deal_match = [d for d in deals if comment in (d.comment or "")]
+if open_match or deal_match:
+    done(0, f"SKIPPED: signal {signal_id} was already traded")
+
+tick = mt5.symbol_info_tick(symbol)
+if tick is None or tick.ask <= 0:
+    done(1, f"FAILED: no price for {symbol}")
+
+if lots < info.volume_min:
+    if info.volume_min > MAX_LOTS:
+        done(1, f"FAILED: minimum lot {info.volume_min} is above MAX_LOTS {MAX_LOTS}")
+    lots = info.volume_min
+if info.volume_step > 0:
+    lots = int(lots / info.volume_step + 1e-7) * info.volume_step
+lots = round(lots, 2)
+
+is_buy = side == "buy"
+order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
+price = tick.ask if is_buy else tick.bid
+
+margin = mt5.order_calc_margin(order_type, symbol, lots, price)
+if margin is None:
+    done(1, f"FAILED: could not calculate margin: {mt5.last_error()}")
+if margin > account.margin_free * 0.95:
+    done(3, f"SKIPPED: {symbol} needs {margin:.2f} margin for {lots} lots but only "
+            f"{account.margin_free:.2f} {account.currency} is free")
+
+flags = info.filling_mode
+if flags & 1:
+    filling = mt5.ORDER_FILLING_FOK
+elif flags & 2:
+    filling = mt5.ORDER_FILLING_IOC
+else:
+    filling = mt5.ORDER_FILLING_RETURN
+
+request = {
+    "action": mt5.TRADE_ACTION_DEAL,
+    "symbol": symbol,
+    "volume": lots,
+    "type": order_type,
+    "price": price,
+    "deviation": 30,
+    "magic": MAGIC,
+    "comment": comment,
+    "type_time": mt5.ORDER_TIME_GTC,
+    "type_filling": filling,
+}
+if sl is not None:
+    request["sl"] = sl
+if tp is not None:
+    request["tp"] = tp
+
+result = mt5.order_send(request)
+print("order_send result:", result)
+if result is None:
+    done(1, f"FAILED: order_send returned None: {mt5.last_error()}")
+if result.retcode not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
+    done(1, f"FAILED: order rejected, retcode={result.retcode}, comment={result.comment}")
+
+done(0, f"TRADE PLACED: {side} {lots} {symbol} at {result.price}, ticket {result.order}, "
+        f"signal {signal_id}, account mode {'DEMO' if is_demo else 'REAL'}")
