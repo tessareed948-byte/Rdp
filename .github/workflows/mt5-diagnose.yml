@@ -1,7 +1,7 @@
 name: MT5 Diagnose
 
-# Diagnostic only. Starts MT5, waits for a broker connection, takes a screenshot
-# and tries several ways of attaching Python. No orders are sent.
+# Diagnostic only. Starts MT5, then tests whether a newer MetaTrader5 Python
+# package can attach to it. No orders are sent.
 # Runs automatically on every push to the mt5-diagnose branch.
 on:
   push:
@@ -26,6 +26,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip show MetaTrader5
+          Write-Host "Versions available on PyPI:"
+          python -m pip index versions MetaTrader5
 
       - name: Install MetaTrader 5
         shell: pwsh
@@ -36,7 +38,7 @@ jobs:
           Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait
           if (-not (Test-Path "C:\MT5\terminal64.exe")) { throw "terminal64.exe not found in C:\MT5" }
 
-      - name: Start MT5, wait for broker, probe Python
+      - name: Start MT5 and probe Python with pinned and newest package
         shell: pwsh
         env:
           MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
@@ -49,26 +51,21 @@ jobs:
           $ini = "C:\mt5.ini"
           @("[Common]","Login=$env:MT5_LOGIN","Password=$env:MT5_PASSWORD","Server=$env:MT5_SERVER","[Experts]","Enabled=1","AllowLiveTrading=0") | Set-Content -LiteralPath $ini -Encoding ASCII
 
-          Write-Host "Shell session id: $((Get-Process -Id $PID).SessionId); user: $(whoami)"
           $proc = Start-Process -FilePath $terminal -ArgumentList @("/portable", "/config:$ini") -PassThru
           Write-Host "Started terminal PID=$($proc.Id)"
-
-          # Wait up to 3 minutes for any sign of a broker connection attempt.
-          $found = $false
-          for ($i = 1; $i -le 12; $i++) {
-            Start-Sleep -Seconds 15
-            $hit = Select-String -Path "C:\MT5\logs\*.log" -Pattern "authorized on|authorization|invalid account|no connection" -ErrorAction SilentlyContinue
-            if ($hit) {
-              $found = $true
-              $hit | Select-Object -Last 5 | ForEach-Object { Write-Host $_.Line }
-              break
-            }
-            Write-Host "No broker connection line yet after $($i * 15) seconds"
-          }
-          Write-Host "Broker connection line found = $found"
+          Start-Sleep -Seconds 90
 
           Write-Host "===== TERMINAL PROCESS ====="
           Get-Process terminal64 -ErrorAction SilentlyContinue | Select-Object Id, SessionId, Responding, MainWindowTitle | Format-List
+
+          Write-Host "===== PROBE 1 WITH PINNED PACKAGE ====="
+          python -m pip show MetaTrader5
+          python mt5_probe.py
+
+          Write-Host "===== UPGRADE MetaTrader5 AND PROBE AGAIN ====="
+          python -m pip install --upgrade MetaTrader5
+          python -m pip show MetaTrader5
+          python mt5_probe.py
 
           Write-Host "===== SCREENSHOT ====="
           try {
@@ -82,13 +79,6 @@ jobs:
           } catch {
             Write-Host "Screenshot failed: $_"
           }
-
-          Write-Host "===== PYTHON PROBE ====="
-          python mt5_probe.py
-
-          Write-Host "===== TERMINAL LOG CONNECTION LINES ====="
-          Select-String -Path "C:\MT5\logs\*.log" -Pattern "Network|authorized|login|failed|invalid|connect" -ErrorAction SilentlyContinue |
-            Select-Object -Last 25 | ForEach-Object { Write-Host $_.Line }
 
           Copy-Item -Path "C:\MT5\logs" -Destination "$env:GITHUB_WORKSPACE\mt5-logs" -Recurse -ErrorAction SilentlyContinue
           Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
