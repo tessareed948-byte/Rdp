@@ -110,107 +110,39 @@ jobs:
           "MT5_TERMINAL_PATH=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "MT5 terminal verified at: $terminal"
 
-      - name: Start MT5 and run Python attach in the SAME step
+      - name: Run original MT5 initialize/login method (no manual terminal launch)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $terminal = $env:MT5_TERMINAL_PATH
-          if (-not $terminal -or -not (Test-Path -LiteralPath $terminal)) {
-            throw "Verified MT5_TERMINAL_PATH is missing."
-          }
-          $env:MT5_TERMINAL_PATH = $terminal
-          $ini = "C:\mt5-fxdesk-demo.ini"
           $resultPath = Join-Path $env:GITHUB_WORKSPACE "fxdesk-execution-result.json"
-          @(
-            "[Common]"
-            "Login=$env:MT5_LOGIN"
-            "Password=$env:MT5_PASSWORD"
-            "Server=$env:MT5_SERVER"
-            "[Experts]"
-            "Enabled=1"
-            "AllowLiveTrading=0"
-          ) | Set-Content -LiteralPath $ini -Encoding ASCII
 
-          try {
-            # This mirrors the known-good MT5 Python Demo Trade workflow:
-            # start terminal and invoke its Python script in the SAME Actions step.
-            $existing = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
-              Where-Object { $_.ExecutablePath -eq $terminal }
-            if (-not $existing) {
-              $proc = Start-Process -FilePath $terminal -ArgumentList @("/portable", "/config:$ini") -PassThru
-              Write-Host "Started MT5 terminal. PID=$($proc.Id)"
-            } else {
-              Write-Host "MT5 terminal already running. PID(s)=$($existing.ProcessId -join ', ')"
-            }
-
-            $running = $null
-            for ($i = 0; $i -lt 24; $i++) {
-              Start-Sleep -Seconds 5
-              $running = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
-                Where-Object { $_.ExecutablePath -eq $terminal }
-              if ($running) { break }
-            }
-            if (-not $running) { throw "MT5 terminal did not start or remain running after 120 seconds." }
-            Start-Sleep -Seconds 90
-
-            Write-Host "===== MT5 PROCESS DIAGNOSTICS (SAME STEP AS PYTHON) ====="
-            Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
-              Select-Object ProcessId, SessionId, ExecutablePath, CommandLine | Format-List
-
-            Write-Host "===== MT5 LOG TAILS ====="
-            $logRoots = @("C:\MT5\logs", "C:\MT5\MQL5\Logs", "$env:APPDATA\MetaQuotes\Terminal") |
-              Where-Object { Test-Path -LiteralPath $_ }
-            foreach ($root in $logRoots) {
-              Write-Host "Log root: $root"
-              Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Extension -in @(".log", ".txt") } |
-                Sort-Object LastWriteTime -Descending |
-                Select-Object -First 3 |
-                ForEach-Object {
-                  Write-Host "---- $($_.FullName) ----"
-                  Get-Content -LiteralPath $_.FullName -Tail 30 -ErrorAction SilentlyContinue
-                }
-            }
-
-            if ([string]::IsNullOrWhiteSpace($env:SIGNAL_PAYLOAD)) {
-              Write-Host "No signal payload: connection check only; no order can be sent."
-              $output = & python fxdesk_demo_executor.py --self-test 2>&1
-            } else {
-              $output = & python fxdesk_demo_executor.py 2>&1
-            }
-            $pythonExit = $LASTEXITCODE
-            $output | ForEach-Object { Write-Host $_ }
-            $resultLine = $output | Where-Object { "$_" -like "EXECUTION_RESULT=*" } | Select-Object -Last 1
-            if ($resultLine) {
-              "$resultLine".Substring("EXECUTION_RESULT=".Length) |
-                Set-Content -LiteralPath $resultPath -Encoding UTF8
-            } else {
-              $details = ($output | ForEach-Object { "$_" }) -join " "
-              $failure = @{
-                status = "failed"
-                demo = $false
-                order_sent = $false
-                error = $details.Substring(0, [Math]::Min(500, $details.Length))
-              } | ConvertTo-Json -Compress
-              $failure | Set-Content -LiteralPath $resultPath -Encoding UTF8
-            }
-            "FXDESK_EXECUTOR_EXIT_CODE=$pythonExit" | Out-File -FilePath $env:GITHUB_ENV -Append
-            if ($pythonExit -ne 0) { throw "FX Desk demo executor failed with exit code $pythonExit." }
-          } catch {
-            if (-not (Test-Path -LiteralPath $resultPath)) {
-              $message = $_.Exception.Message
-              $failure = @{
-                status = "failed"
-                demo = $false
-                order_sent = $false
-                error = $message.Substring(0, [Math]::Min(500, $message.Length))
-              } | ConvertTo-Json -Compress
-              $failure | Set-Content -LiteralPath $resultPath -Encoding UTF8
-            }
-            throw
-          } finally {
-            Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
+          # Do not Start-Process terminal64.exe, pass /portable, or write a custom
+          # terminal INI here. The original working Python script lets
+          # MetaTrader5.initialize(path, login, password, server) start/attach
+          # using the exact original connection method.
+          if ([string]::IsNullOrWhiteSpace($env:SIGNAL_PAYLOAD)) {
+            Write-Host "No signal payload: original-method Deriv DEMO connection check only; no order can be sent."
+            $output = & python fxdesk_demo_executor.py --self-test 2>&1
+          } else {
+            $output = & python fxdesk_demo_executor.py 2>&1
           }
+          $pythonExit = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          $resultLine = $output | Where-Object { "$_" -like "EXECUTION_RESULT=*" } | Select-Object -Last 1
+          if ($resultLine) {
+            "$resultLine".Substring("EXECUTION_RESULT=".Length) |
+              Set-Content -LiteralPath $resultPath -Encoding UTF8
+          } else {
+            $details = ($output | ForEach-Object { "$_" }) -join " "
+            $failure = @{
+              status = "failed"
+              demo = $false
+              order_sent = $false
+              error = $details.Substring(0, [Math]::Min(500, $details.Length))
+            } | ConvertTo-Json -Compress
+            $failure | Set-Content -LiteralPath $resultPath -Encoding UTF8
+          }
+          if ($pythonExit -ne 0) { throw "FX Desk demo executor failed with exit code $pythonExit." }
 
       - name: Send execution result to Aurora Telegram
         if: ${{ always() && inputs.signal_payload != '' }}
