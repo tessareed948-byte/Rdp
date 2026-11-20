@@ -52,7 +52,7 @@ def test_stable_short_signal_comment():
     assert len(a) <= 31
 
 
-def test_self_test_uses_the_exact_proven_portable_terminal_attach(monkeypatch, tmp_path):
+def test_self_test_uses_original_mt5_initialize_login_method(monkeypatch, tmp_path):
     import sys
     from types import SimpleNamespace
     from fxdesk_demo_executor import execute
@@ -62,7 +62,7 @@ def test_self_test_uses_the_exact_proven_portable_terminal_attach(monkeypatch, t
     calls = []
     fake = SimpleNamespace(
         ACCOUNT_TRADE_MODE_DEMO=0,
-        initialize=lambda **kwargs: calls.append(kwargs) or True,
+        initialize=lambda *args, **kwargs: calls.append((args, kwargs)) or True,
         login=lambda *args, **kwargs: True,
         account_info=lambda: SimpleNamespace(login=123456, server="Deriv-Demo", trade_mode=0),
         terminal_info=lambda: SimpleNamespace(connected=True),
@@ -80,4 +80,4 @@ def test_self_test_uses_the_exact_proven_portable_terminal_attach(monkeypatch, t
     result = execute("", self_test=True)
 
     assert result == {"status": "demo_connection_verified", "demo": True, "order_sent": False}
-    assert calls == [{"path": str(terminal_path), "portable": True, "timeout": 120000}]
+    assert calls == [((str(terminal_path),), {"login": 123456, "password": "not-a-real-password", "server": "Deriv-Demo", "timeout": 60000})]
