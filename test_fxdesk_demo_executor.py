@@ -50,3 +50,34 @@ def test_stable_short_signal_comment():
     a = signal_comment("signal-fingerprint", make_signal())
     assert a == signal_comment("signal-fingerprint", make_signal())
     assert len(a) <= 31
+
+
+def test_self_test_uses_the_exact_proven_portable_terminal_attach(monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace
+    from fxdesk_demo_executor import execute
+
+    terminal_path = tmp_path / "terminal64.exe"
+    terminal_path.write_text("test terminal")
+    calls = []
+    fake = SimpleNamespace(
+        ACCOUNT_TRADE_MODE_DEMO=0,
+        initialize=lambda **kwargs: calls.append(kwargs) or True,
+        login=lambda *args, **kwargs: True,
+        account_info=lambda: SimpleNamespace(login=123456, server="Deriv-Demo", trade_mode=0),
+        terminal_info=lambda: SimpleNamespace(connected=True),
+        shutdown=lambda: None,
+        last_error=lambda: (0, "ok"),
+    )
+    monkeypatch.setitem(sys.modules, "MetaTrader5", fake)
+    monkeypatch.setenv("DEMO_ONLY", "true")
+    monkeypatch.setenv("ALLOW_DEMO_TRADING", "false")
+    monkeypatch.setenv("MT5_LOGIN", "123456")
+    monkeypatch.setenv("MT5_PASSWORD", "not-a-real-password")
+    monkeypatch.setenv("MT5_SERVER", "Deriv-Demo")
+    monkeypatch.setenv("MT5_TERMINAL_PATH", str(terminal_path))
+
+    result = execute("", self_test=True)
+
+    assert result == {"status": "demo_connection_verified", "demo": True, "order_sent": False}
+    assert calls == [{"path": str(terminal_path), "portable": True, "timeout": 120000}]
