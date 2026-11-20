@@ -1,0 +1,124 @@
+name: Headway Live Test
+
+# ONE-TIME live test on the Headway account, started by the owner's request.
+# Runs on every push to the headway-live-test branch. The fixed signal ID means a
+# second run will skip instead of trading again. The main workflow stays gated by ALLOW_LIVE.
+on:
+  push:
+    branches: [headway-live-test]
+
+concurrency:
+  group: headway-live-test
+  cancel-in-progress: false
+
+jobs:
+  trade:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install MetaTrader5==5.0.6231
+
+      - name: Find and install the broker terminal
+        shell: pwsh
+        env:
+          MT5_INSTALLER_URL: ${{ vars.MT5_INSTALLER_URL }}
+        run: |
+          $installer = Join-Path $env:TEMP "mt5installer.exe"
+          $candidates = @()
+          if ($env:MT5_INSTALLER_URL) { $candidates += $env:MT5_INSTALLER_URL }
+          $candidates += @(
+            "https://download.mql5.com/cdn/web/headway.ltd/mt5/headway5setup.exe",
+            "https://download.mql5.com/cdn/web/headway.limited/mt5/headway5setup.exe",
+            "https://download.mql5.com/cdn/web/headway.com/mt5/headway5setup.exe",
+            "https://download.mql5.com/cdn/web/headway.group/mt5/headway5setup.exe"
+          )
+          $found = $false
+          foreach ($url in $candidates) {
+            try {
+              Invoke-WebRequest $url -OutFile $installer -ErrorAction Stop
+              if ((Get-Item $installer).Length -gt 500KB) {
+                Write-Host "Using installer: $url"
+                $found = $true
+                break
+              }
+            } catch {
+              Write-Host "Not available: $url"
+            }
+          }
+          if (-not $found) {
+            Write-Host "No Headway installer found. Using the generic MetaQuotes installer; the server secret must then be an IP address."
+            Invoke-WebRequest "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
+          }
+          New-Item -ItemType Directory -Path "C:\MT5" -Force | Out-Null
+          Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait
+          if (-not (Test-Path "C:\MT5\terminal64.exe")) { throw "terminal64.exe not found in C:\MT5" }
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
+
+      - name: Connect and place one live test trade
+        shell: pwsh
+        env:
+          MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
+          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+          MT5_TERMINAL_PATH: 'C:\MT5\terminal64.exe'
+          ALLOW_LIVE: "true"
+          MAX_LOTS: "0.01"
+          SIG_SYMBOL: "AUTO"
+          SIG_SIDE: "buy"
+          SIG_LOTS: "0.01"
+          SIG_ID: "headway-test-1"
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          function Get-SyncCount {
+            $f = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $f) { return 0 }
+            return @(Get-Content -LiteralPath $f.FullName | Select-String -Pattern "terminal synchronized with").Count
+          }
+
+          $ini = "C:\mt5_login.ini"
+          @(
+            "[Common]"
+            "Login=$env:MT5_LOGIN"
+            "Password=$env:MT5_PASSWORD"
+            "Server=$env:MT5_SERVER"
+            "[Experts]"
+            "Enabled=1"
+            "AllowLiveTrading=1"
+          ) | Set-Content -LiteralPath $ini -Encoding ASCII
+
+          $before = Get-SyncCount
+          $proc = Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList @("/portable", "/config:$ini") -PassThru
+          Write-Host "Terminal started. PID=$($proc.Id)"
+          for ($i = 1; $i -le 36; $i++) {
+            Start-Sleep -Seconds 5
+            if ((Get-SyncCount) -gt $before) {
+              Write-Host "Terminal synchronized after $($i * 5) seconds"
+              break
+            }
+          }
+          Start-Sleep -Seconds 10
+
+          python mt5_signal_trade.py
+          $code = $LASTEXITCODE
+
+          Write-Host "===== TERMINAL NETWORK LINES ====="
+          $tlog = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($tlog) {
+            Get-Content -LiteralPath $tlog.FullName | Select-String -Pattern "Network|authoriz|synchronized" | Select-Object -Last 12 | ForEach-Object { Write-Host $_.Line }
+          }
+
+          Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
+          exit $code
