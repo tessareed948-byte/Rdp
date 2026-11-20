@@ -75,13 +75,14 @@ def execute(signal_payload: str, signal_key: str = "", self_test: bool = False) 
         raise RuntimeError("Demo execution is not enabled")
     import MetaTrader5 as mt5
     login, password, server = int(_required("MT5_LOGIN")), _required("MT5_PASSWORD"), _required("MT5_SERVER")
-    terminal_path = os.getenv("MT5_TERMINAL_PATH", "").strip()
-    # Match the proven Deriv demo workflow: attach to the already-started
-    # portable terminal, retry IPC without shutting it down between attempts.
+    terminal_path = _required("MT5_TERMINAL_PATH")
+    if not os.path.isfile(terminal_path):
+        raise RuntimeError("MT5_TERMINAL_PATH does not point to the installed terminal executable")
+    # Exact attach mode used by the proven MT5 Python Demo Trade script.
+    # Keep the same portable data folder and retry IPC without shutting down.
     initialized, init_error = False, None
     for attempt in range(1, 6):
-        initialized = (mt5.initialize(path=terminal_path, portable=True, timeout=120000)
-                       if terminal_path else mt5.initialize(timeout=120000))
+        initialized = mt5.initialize(path=terminal_path, portable=True, timeout=120000)
         if initialized:
             break
         init_error = mt5.last_error()
