@@ -41,6 +41,8 @@ jobs:
       MT5_MAGIC: "20261120"
       SIGNAL_KEY: ${{ inputs.signal_key }}
       SIGNAL_PAYLOAD: ${{ inputs.signal_payload }}
+      FXDESK_CALLBACK_URL: ${{ secrets.FXDESK_CALLBACK_URL }}
+      FXDESK_CALLBACK_SECRET: ${{ secrets.FXDESK_CALLBACK_SECRET }}
 
     steps:
       - name: Checkout isolated executor
@@ -68,39 +70,171 @@ jobs:
           }
           if ($env:DEMO_ONLY -ne "true" -or $env:ALLOW_DEMO_TRADING -ne "true") { throw "Unsafe workflow configuration." }
           if ($env:MT5_SERVER -notmatch "(?i)deriv") { throw "Configured server is not identified as Deriv." }
+      - name: Require result callback for every signal execution
+        if: ${{ inputs.signal_payload != '' }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:FXDESK_CALLBACK_URL) -or
+              [string]::IsNullOrWhiteSpace($env:FXDESK_CALLBACK_SECRET)) {
+            throw "Signal execution is blocked until FXDESK_CALLBACK_URL and FXDESK_CALLBACK_SECRET are configured."
+          }
       - name: Install MT5 terminal
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $installer = Join-Path $env:TEMP "mt5setup.exe"
           Invoke-WebRequest "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
-          if ((Get-Item $installer).Length -lt 1000000) { throw "MT5 installer download is unexpectedly small." }
-          New-Item -ItemType Directory -Path "C:\MT5" -Force | Out-Null
-          Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait
-          if (-not (Test-Path "C:\MT5\terminal64.exe")) { throw "MT5 terminal install could not be verified." }
-      - name: Start terminal with live trading disabled
+          if ((Get-Item $installer).Length -lt 1000000) { throw "MetaTrader installer download is unexpectedly small" }
+
+          # Match the proven MT5 Python Demo Trade installation and path discovery.
+          $target = "C:\MT5"
+          New-Item -ItemType Directory -Path $target -Force | Out-Null
+          $process = Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait -PassThru
+          Write-Host "MetaTrader installer process exited with code $($process.ExitCode)"
+
+          $terminal = Join-Path $target "terminal64.exe"
+          if (-not (Test-Path $terminal)) {
+            $candidates = @(
+              "$env:ProgramFiles\MetaTrader 5\terminal64.exe",
+              "${env:ProgramFiles(x86)}\MetaTrader 5\terminal64.exe",
+              "$env:APPDATA\MetaQuotes\Terminal\terminal64.exe"
+            )
+            $terminal = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $terminal) {
+            $terminal = Get-ChildItem -Path @("C:\MT5", "$env:ProgramFiles\MetaTrader 5", "${env:ProgramFiles(x86)}\MetaTrader 5") -Filter terminal64.exe -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $terminal) {
+            throw "MT5 terminal installation could not be verified after automatic installation"
+          }
+          "MT5_TERMINAL_PATH=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "MT5 terminal verified at: $terminal"
+
+      - name: Start terminal using the proven portable configuration
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $terminal = $env:MT5_TERMINAL_PATH
+          if (-not $terminal -or -not (Test-Path -LiteralPath $terminal)) {
+            throw "Verified MT5_TERMINAL_PATH is missing."
+          }
           $ini = "C:\mt5-fxdesk-demo.ini"
-          @("[Common]","Login=$env:MT5_LOGIN","Password=$env:MT5_PASSWORD","Server=$env:MT5_SERVER","[Experts]","Enabled=1","AllowLiveTrading=0") | Set-Content -LiteralPath $ini -Encoding ASCII
-          Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList @("/portable", "/config:$ini") | Out-Null
-          $running = $false
-          for ($i=0; $i -lt 24; $i++) { Start-Sleep -Seconds 5; if (Get-Process terminal64 -ErrorAction SilentlyContinue) { $running=$true; break } }
-          if (-not $running) { throw "MT5 terminal did not start." }
-          # The proven Deriv demo workflow allows the portable terminal to
-          # finish broker startup before Python attaches through MT5 IPC.
+          @(
+            "[Common]"
+            "Login=$env:MT5_LOGIN"
+            "Password=$env:MT5_PASSWORD"
+            "Server=$env:MT5_SERVER"
+            "[Experts]"
+            "Enabled=1"
+            "AllowLiveTrading=0"
+          ) | Set-Content -LiteralPath $ini -Encoding ASCII
+
+          $existing = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -eq $terminal }
+          if (-not $existing) {
+            $proc = Start-Process -FilePath $terminal -ArgumentList @("/portable", "/config:$ini") -PassThru
+            Write-Host "Started MT5 terminal. PID=$($proc.Id)"
+          } else {
+            Write-Host "MT5 terminal already running. PID(s)=$($existing.ProcessId -join ', ')"
+          }
+
+          $running = $null
+          for ($i = 0; $i -lt 24; $i++) {
+            Start-Sleep -Seconds 5
+            $running = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { $_.ExecutablePath -eq $terminal }
+            if ($running) { break }
+          }
+          if (-not $running) {
+            throw "MT5 terminal did not start or remain running after 120 seconds."
+          }
           Start-Sleep -Seconds 90
-          Write-Host "MT5 terminal startup grace period completed."
+
+          Write-Host "===== MT5 PROCESS DIAGNOSTICS ====="
+          Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
+            Select-Object ProcessId, SessionId, ExecutablePath, CommandLine | Format-List
+
+          Write-Host "===== MT5 LOG TAILS ====="
+          $logRoots = @("C:\MT5\logs", "C:\MT5\MQL5\Logs", "$env:APPDATA\MetaQuotes\Terminal") |
+            Where-Object { Test-Path -LiteralPath $_ }
+          foreach ($root in $logRoots) {
+            Write-Host "Log root: $root"
+            Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Extension -in @(".log", ".txt") } |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 3 |
+              ForEach-Object {
+                Write-Host "---- $($_.FullName) ----"
+                Get-Content -LiteralPath $_.FullName -Tail 30 -ErrorAction SilentlyContinue
+              }
+          }
+          Write-Host "Portable MT5 startup grace period completed. Python will attach with portable=True."
       - name: Execute one FX Desk signal or no-order connection test
         shell: pwsh
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:SIGNAL_PAYLOAD)) {
-            Write-Host "No signal payload: connection check only; no order can be sent."
-            python fxdesk_demo_executor.py --self-test
-          } else {
-            python fxdesk_demo_executor.py
+          $ErrorActionPreference = "Stop"
+          $resultPath = Join-Path $env:GITHUB_WORKSPACE "fxdesk-execution-result.json"
+          $exitCode = 0
+          $output = @()
+          try {
+            if ([string]::IsNullOrWhiteSpace($env:SIGNAL_PAYLOAD)) {
+              Write-Host "No signal payload: connection check only; no order can be sent."
+              $output = & python fxdesk_demo_executor.py --self-test 2>&1
+            } else {
+              $output = & python fxdesk_demo_executor.py 2>&1
+            }
+            $pythonExit = $LASTEXITCODE
+            $output | ForEach-Object { Write-Host $_ }
+            $resultLine = $output | Where-Object { "$_" -like "EXECUTION_RESULT=*" } | Select-Object -Last 1
+            if ($resultLine) {
+              $json = "$resultLine".Substring("EXECUTION_RESULT=".Length)
+              $json | Set-Content -LiteralPath $resultPath -Encoding UTF8
+            } else {
+              $details = ($output | ForEach-Object { "$_" }) -join " "
+              $failure = @{
+                status = "failed"
+                demo = $false
+                order_sent = $false
+                error = $details.Substring(0, [Math]::Min(500, $details.Length))
+              } | ConvertTo-Json -Compress
+              $failure | Set-Content -LiteralPath $resultPath -Encoding UTF8
+            }
+            if ($pythonExit -ne 0) { $exitCode = $pythonExit }
+          } catch {
+            $exitCode = 1
+            $failure = @{
+              status = "failed"
+              demo = $false
+              order_sent = $false
+              error = $_.Exception.Message.Substring(0, [Math]::Min(500, $_.Exception.Message.Length))
+            } | ConvertTo-Json -Compress
+            $failure | Set-Content -LiteralPath $resultPath -Encoding UTF8
           }
-          if ($LASTEXITCODE -ne 0) { throw "FX Desk demo executor failed." }
+          "FXDESK_EXECUTOR_EXIT_CODE=$exitCode" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if ($exitCode -ne 0) { throw "FX Desk demo executor failed with exit code $exitCode." }
+
+      - name: Send execution result to Aurora Telegram
+        if: ${{ always() && inputs.signal_payload != '' }}
+        shell: pwsh
+        run: |
+          $resultPath = Join-Path $env:GITHUB_WORKSPACE "fxdesk-execution-result.json"
+          if (Test-Path -LiteralPath $resultPath) {
+            $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+          } else {
+            $result = @{
+              status = "runner_failed_before_executor"
+              demo = $false
+              order_sent = $false
+              error = "The runner stopped before the executor produced a result."
+            }
+          }
+          $body = @{
+            fingerprint = $env:SIGNAL_KEY
+            result = $result
+          } | ConvertTo-Json -Depth 8 -Compress
+          Invoke-RestMethod -Uri $env:FXDESK_CALLBACK_URL -Method Post -Headers @{ "X-FXDesk-Callback-Secret" = $env:FXDESK_CALLBACK_SECRET } -ContentType "application/json" -Body $body | Out-Null
+          Write-Host "Execution outcome delivered to Aurora Telegram monitoring endpoint."
+
       - name: Shut down runner terminal
         if: always()
         shell: pwsh
