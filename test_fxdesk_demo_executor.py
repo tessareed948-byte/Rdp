@@ -52,7 +52,7 @@ def test_stable_short_signal_comment():
     assert len(a) <= 31
 
 
-def test_self_test_uses_original_mt5_initialize_login_method(monkeypatch, tmp_path):
+def test_self_test_attaches_to_pre_authenticated_deriv_terminal(monkeypatch, tmp_path):
     import sys
     from types import SimpleNamespace
     from fxdesk_demo_executor import execute
@@ -80,4 +80,6 @@ def test_self_test_uses_original_mt5_initialize_login_method(monkeypatch, tmp_pa
     result = execute("", self_test=True)
 
     assert result == {"status": "demo_connection_verified", "demo": True, "order_sent": False}
-    assert calls == [((str(terminal_path),), {"login": 123456, "password": "not-a-real-password", "server": "Deriv-Demo", "timeout": 60000})]
+    # The workflow authenticates the Deriv terminal via its portable INI first.
+    # Python must attach to that terminal without attempting a second broker login.
+    assert calls == [((), {"path": str(terminal_path), "portable": True, "timeout": 120000})]
