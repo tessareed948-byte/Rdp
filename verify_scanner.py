@@ -1,5 +1,4 @@
-"""Pulls XAUUSD M15 candles from the broker terminal and studies volatility-scaled stops on the
-1h and 45m scanners. Read-only: no orders are sent."""
+"""Read-only Deriv DEMO verification and backtest of the XAU indicator port."""
 import os
 import sys
 import time
@@ -8,7 +7,7 @@ import MetaTrader5 as mt5
 import pandas as pd
 
 from scanner_atr import atr_study
-from scanner_report import CONFIGS
+from scanner_report import CONFIGS, analyse, entry_method_table
 
 TERMINAL = os.environ["MT5_TERMINAL_PATH"]
 SYMBOL = os.getenv("SCAN_SYMBOL", "XAUUSD").strip()
@@ -26,8 +25,16 @@ if not mt5.initialize(path=TERMINAL, portable=True, timeout=120000):
     sys.exit(1)
 
 account = mt5.account_info()
-if account is None:
-    fail("the terminal is not logged in")
+terminal = mt5.terminal_info()
+if account is None or terminal is None or not terminal.connected:
+    fail("the terminal is not logged in and connected")
+if account.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO:
+    fail("SAFETY STOP: verification requires a DEMO account")
+if "deriv" not in str(account.server).lower():
+    fail("SAFETY STOP: connected broker server is not identified as Deriv")
+if not terminal.trade_allowed:
+    print("INFO: terminal Algo Trading is disabled; this verification is read-only.")
+print(f"READ-ONLY DEMO VERIFIED: login={account.login}, server={account.server}")
 
 symbol = SYMBOL
 if mt5.symbol_info(symbol) is None:
@@ -35,7 +42,8 @@ if mt5.symbol_info(symbol) is None:
     if not names:
         fail("no XAUUSD symbol on this server")
     symbol = names[0]
-mt5.symbol_select(symbol, True)
+if not mt5.symbol_select(symbol, True):
+    fail("could not select broker gold symbol " + symbol)
 info = mt5.symbol_info(symbol)
 
 tick = None
@@ -74,7 +82,12 @@ m15 = m15[~m15.index.duplicated()].sort_index()
 m15 = m15[m15.index + pd.Timedelta(minutes=15) <= pd.Timestamp.now(tz="UTC")]
 print(f"M15 candles: {len(m15)} from {m15.index[0]:%Y-%m-%d} to {m15.index[-1]:%Y-%m-%d %H:%M} UTC")
 
-for cfg in (CONFIGS[0], CONFIGS[2]):
-    print("\n".join(atr_study(m15, *cfg)))
-    print()
+# Evaluate both the 1h indicator and the 45m chart with its configured New York anchor.
+for label, minutes, anchor in (CONFIGS[0], CONFIGS[2]):
+    print("\n".join(atr_study(m15, label, minutes, anchor)))
+    report, _, _ = analyse(m15, label, minutes, anchor)
+    print("\n".join(report))
+    print("\n".join(entry_method_table(m15, label, minutes, anchor)))
+
+print("VERIFICATION COMPLETE: read-only scan/backtest; no order_send call exists in this script.")
 mt5.shutdown()
