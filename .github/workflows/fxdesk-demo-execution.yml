@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/fxdesk-demo-execution.yml"
       - "fxdesk_demo_executor.py"
+      - "test_fxdesk_demo_executor.py"
   workflow_dispatch:
     inputs:
       signal_key:
