@@ -1,9 +1,13 @@
 """Places ONE order from a signal on the connected MT5 account.
 
 All inputs arrive as environment variables set by the workflow, never as shell text.
+Lot size can come from the signal in two ways:
+  * SIG_LOTS      a fixed lot size
+  * SIG_RISK      percent of the account balance to risk, sized from the stop loss
 Safety rules enforced here:
   * live (non-demo) accounts are refused unless ALLOW_LIVE=true
-  * lot size is capped by MAX_LOTS
+  * lot size is capped by MAX_LOTS and risk by MAX_RISK_PCT
+  * stop loss and take profit must be on the correct side of the entry price
   * the order is skipped if the required margin does not fit the free margin
   * a signal ID that was already traded (open position or recent deal) is skipped
   * SIG_SYMBOL=AUTO picks the cheapest-margin major that the free margin can carry
@@ -23,6 +27,7 @@ SERVER = os.environ["MT5_SERVER"].strip()
 
 ALLOW_LIVE = os.getenv("ALLOW_LIVE", "false").strip().lower() == "true"
 MAX_LOTS = float(os.getenv("MAX_LOTS", "").strip() or "0.01")
+MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "").strip() or "2")
 MAGIC = 20261118
 
 AUTO_BASES = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD",
@@ -64,15 +69,22 @@ if side not in ("buy", "sell"):
 if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", signal_id):
     done(1, "FAILED: signal_id may only contain letters, digits, dash and underscore (max 20)")
 
-lots = number("lots", os.getenv("SIG_LOTS"))
-lots = MAX_LOTS if lots is None else min(lots, MAX_LOTS)
+lots_req = number("lots", os.getenv("SIG_LOTS"))
+risk_pct = number("risk_pct", os.getenv("SIG_RISK"))
 sl = number("sl", os.getenv("SIG_SL"))
 tp = number("tp", os.getenv("SIG_TP"))
+if risk_pct is not None:
+    if risk_pct <= 0:
+        done(1, "FAILED: risk_pct must be above zero")
+    if sl is None:
+        done(1, "FAILED: risk_pct needs a stop loss")
+    risk_pct = min(risk_pct, MAX_RISK_PCT)
+
 comment = f"sig-{signal_id}"[:31]
 is_buy = side == "buy"
 order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
 
-print(f"Signal: {side} {symbol_in} lots<={lots} sl={sl} tp={tp} id={signal_id}")
+print(f"Signal: {side} {symbol_in} lots={lots_req} risk%={risk_pct} sl={sl} tp={tp} id={signal_id}")
 
 if not mt5.initialize(path=TERMINAL, portable=True, timeout=120000):
     print("FAILED: initialize ->", mt5.last_error())
@@ -108,10 +120,6 @@ if open_match or deal_match:
     done(0, f"SKIPPED: signal {signal_id} was already traded")
 
 
-def min_lot(info):
-    return max(info.volume_min, 0.0)
-
-
 def pick_auto_symbol():
     """Cheapest-margin major whose minimum lot fits the free margin."""
     names = [s.name for s in (mt5.symbols_get() or [])]
@@ -126,7 +134,7 @@ def pick_auto_symbol():
             tick = mt5.symbol_info_tick(name)
             if tick is None or tick.ask <= 0:
                 continue
-            lot = min_lot(info)
+            lot = max(info.volume_min, 0.0)
             if lot > MAX_LOTS:
                 print(f"  {name}: minimum lot {lot} is above MAX_LOTS")
                 continue
@@ -165,16 +173,45 @@ if not mt5.symbol_select(symbol, True):
 tick = mt5.symbol_info_tick(symbol)
 if tick is None or tick.ask <= 0:
     done(1, f"FAILED: no price for {symbol}")
+price = tick.ask if is_buy else tick.bid
 
+# Stop loss and take profit must be on the right side and not too close to the price.
+min_distance = (info.trade_stops_level or 0) * info.point
+if sl is not None:
+    if (is_buy and sl >= price) or (not is_buy and sl <= price):
+        done(1, f"FAILED: stop loss {sl} is on the wrong side of the entry price {price}")
+    if abs(price - sl) < min_distance:
+        done(1, f"FAILED: stop loss is closer than the broker minimum distance {min_distance}")
+if tp is not None:
+    if (is_buy and tp <= price) or (not is_buy and tp >= price):
+        done(1, f"FAILED: take profit {tp} is on the wrong side of the entry price {price}")
+    if abs(price - tp) < min_distance:
+        done(1, f"FAILED: take profit is closer than the broker minimum distance {min_distance}")
+
+# Work out the lot size.
+if risk_pct is not None:
+    loss_per_lot = mt5.order_calc_profit(order_type, symbol, 1.0, price, sl)
+    if loss_per_lot is None or loss_per_lot >= 0:
+        done(1, "FAILED: could not work out the loss per lot from the stop loss")
+    risk_amount = min(account.balance, account.equity) * risk_pct / 100.0
+    lots = risk_amount / abs(loss_per_lot)
+    print(f"Risk sizing: {risk_pct}% of balance = {risk_amount:.4f} {account.currency}; "
+          f"loss per lot at the stop {abs(loss_per_lot):.4f}; raw lots {lots:.4f}")
+else:
+    lots = MAX_LOTS if lots_req is None else lots_req
+lots = min(lots, MAX_LOTS)
+
+if info.volume_step > 0:
+    lots = int(lots / info.volume_step + 1e-7) * info.volume_step
 if lots < info.volume_min:
+    if risk_pct is not None:
+        done(3, f"SKIPPED: a {risk_pct}% risk gives {lots:.4f} lots, below the broker minimum "
+                f"{info.volume_min}. Raising it would risk more than planned.")
     if info.volume_min > MAX_LOTS:
         done(1, f"FAILED: minimum lot {info.volume_min} is above MAX_LOTS {MAX_LOTS}")
     lots = info.volume_min
-if info.volume_step > 0:
-    lots = int(lots / info.volume_step + 1e-7) * info.volume_step
 lots = round(lots, 2)
 
-price = tick.ask if is_buy else tick.bid
 margin = mt5.order_calc_margin(order_type, symbol, lots, price)
 if margin is None:
     done(1, f"FAILED: could not calculate margin: {mt5.last_error()}")
@@ -214,5 +251,5 @@ if result is None:
 if result.retcode not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
     done(1, f"FAILED: order rejected, retcode={result.retcode}, comment={result.comment}")
 
-done(0, f"TRADE PLACED: {side} {lots} {symbol} at {result.price}, ticket {result.order}, "
-        f"signal {signal_id}, account mode {'DEMO' if is_demo else 'REAL'}")
+done(0, f"TRADE PLACED: {side} {lots} {symbol} at {result.price}, sl={sl}, tp={tp}, "
+        f"ticket {result.order}, signal {signal_id}, account mode {'DEMO' if is_demo else 'REAL'}")
