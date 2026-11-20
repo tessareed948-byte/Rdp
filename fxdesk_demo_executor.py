@@ -78,18 +78,13 @@ def execute(signal_payload: str, signal_key: str = "", self_test: bool = False) 
     terminal_path = _required("MT5_TERMINAL_PATH")
     if not os.path.isfile(terminal_path):
         raise RuntimeError("MT5_TERMINAL_PATH does not point to the installed terminal executable")
-    # Use the exact initialization/login method from the original working
-    # demo_gold_test_order.py and mt5_bridge.py. No portable=True and no
-    # separate initialize-then-login retry loop.
-    initialized = mt5.initialize(
-        terminal_path,
-        login=login,
-        password=password,
-        server=server,
-        timeout=60000,
-    )
+    # Match the proven Deriv XAU workflow exactly: credentials are loaded
+    # into the Deriv terminal through its portable config before startup.
+    # Python attaches to that already-authenticated Deriv terminal; it does
+    # not perform a second broker login.
+    initialized = mt5.initialize(path=terminal_path, portable=True, timeout=120000)
     if not initialized:
-        raise RuntimeError("Original MT5 initialize/login method failed: " + str(mt5.last_error()))
+        raise RuntimeError("Deriv terminal IPC attach failed: " + str(mt5.last_error()))
     try:
         account, terminal = mt5.account_info(), mt5.terminal_info()
         if account is None or terminal is None or not terminal.connected:
