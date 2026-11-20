@@ -74,23 +74,91 @@ jobs:
           $ErrorActionPreference = "Stop"
           $installer = Join-Path $env:TEMP "mt5setup.exe"
           Invoke-WebRequest "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
-          if ((Get-Item $installer).Length -lt 1000000) { throw "MT5 installer download is unexpectedly small." }
-          New-Item -ItemType Directory -Path "C:\MT5" -Force | Out-Null
-          Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait
-          if (-not (Test-Path "C:\MT5\terminal64.exe")) { throw "MT5 terminal install could not be verified." }
-      - name: Start terminal with live trading disabled
+          if ((Get-Item $installer).Length -lt 1000000) { throw "MetaTrader installer download is unexpectedly small" }
+
+          # Match the proven MT5 Python Demo Trade installation and path discovery.
+          $target = "C:\MT5"
+          New-Item -ItemType Directory -Path $target -Force | Out-Null
+          $process = Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait -PassThru
+          Write-Host "MetaTrader installer process exited with code $($process.ExitCode)"
+
+          $terminal = Join-Path $target "terminal64.exe"
+          if (-not (Test-Path $terminal)) {
+            $candidates = @(
+              "$env:ProgramFiles\MetaTrader 5\terminal64.exe",
+              "${env:ProgramFiles(x86)}\MetaTrader 5\terminal64.exe",
+              "$env:APPDATA\MetaQuotes\Terminal\terminal64.exe"
+            )
+            $terminal = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $terminal) {
+            $terminal = Get-ChildItem -Path @("C:\MT5", "$env:ProgramFiles\MetaTrader 5", "${env:ProgramFiles(x86)}\MetaTrader 5") -Filter terminal64.exe -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $terminal) {
+            throw "MT5 terminal installation could not be verified after automatic installation"
+          }
+          "MT5_TERMINAL_PATH=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "MT5 terminal verified at: $terminal"
+
+      - name: Start terminal using the proven portable configuration
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $terminal = $env:MT5_TERMINAL_PATH
+          if (-not $terminal -or -not (Test-Path -LiteralPath $terminal)) {
+            throw "Verified MT5_TERMINAL_PATH is missing."
+          }
           $ini = "C:\mt5-fxdesk-demo.ini"
-          @("[Common]","Login=$env:MT5_LOGIN","Password=$env:MT5_PASSWORD","Server=$env:MT5_SERVER","[Experts]","Enabled=1","AllowLiveTrading=0") | Set-Content -LiteralPath $ini -Encoding ASCII
-          Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList @("/portable", "/config:$ini") | Out-Null
-          $running = $false
-          for ($i=0; $i -lt 24; $i++) { Start-Sleep -Seconds 5; if (Get-Process terminal64 -ErrorAction SilentlyContinue) { $running=$true; break } }
-          if (-not $running) { throw "MT5 terminal did not start." }
-          # The proven Deriv demo workflow allows the portable terminal to
-          # finish broker startup before Python attaches through MT5 IPC.
+          @(
+            "[Common]"
+            "Login=$env:MT5_LOGIN"
+            "Password=$env:MT5_PASSWORD"
+            "Server=$env:MT5_SERVER"
+            "[Experts]"
+            "Enabled=1"
+            "AllowLiveTrading=0"
+          ) | Set-Content -LiteralPath $ini -Encoding ASCII
+
+          $existing = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -eq $terminal }
+          if (-not $existing) {
+            $proc = Start-Process -FilePath $terminal -ArgumentList @("/portable", "/config:$ini") -PassThru
+            Write-Host "Started MT5 terminal. PID=$($proc.Id)"
+          } else {
+            Write-Host "MT5 terminal already running. PID(s)=$($existing.ProcessId -join ', ')"
+          }
+
+          $running = $null
+          for ($i = 0; $i -lt 24; $i++) {
+            Start-Sleep -Seconds 5
+            $running = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { $_.ExecutablePath -eq $terminal }
+            if ($running) { break }
+          }
+          if (-not $running) {
+            throw "MT5 terminal did not start or remain running after 120 seconds."
+          }
           Start-Sleep -Seconds 90
-          Write-Host "MT5 terminal startup grace period completed."
+
+          Write-Host "===== MT5 PROCESS DIAGNOSTICS ====="
+          Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
+            Select-Object ProcessId, SessionId, ExecutablePath, CommandLine | Format-List
+
+          Write-Host "===== MT5 LOG TAILS ====="
+          $logRoots = @("C:\MT5\logs", "C:\MT5\MQL5\Logs", "$env:APPDATA\MetaQuotes\Terminal") |
+            Where-Object { Test-Path -LiteralPath $_ }
+          foreach ($root in $logRoots) {
+            Write-Host "Log root: $root"
+            Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Extension -in @(".log", ".txt") } |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 3 |
+              ForEach-Object {
+                Write-Host "---- $($_.FullName) ----"
+                Get-Content -LiteralPath $_.FullName -Tail 30 -ErrorAction SilentlyContinue
+              }
+          }
+          Write-Host "Portable MT5 startup grace period completed. Python will attach with portable=True."
       - name: Execute one FX Desk signal or no-order connection test
         shell: pwsh
         run: |
