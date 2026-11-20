@@ -34,33 +34,59 @@ jobs:
         shell: pwsh
         env:
           MT5_INSTALLER_URL: ${{ vars.MT5_INSTALLER_URL }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
         run: |
           $installer = Join-Path $env:TEMP "mt5installer.exe"
+          $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
           $candidates = @()
           if ($env:MT5_INSTALLER_URL) { $candidates += $env:MT5_INSTALLER_URL }
+
+          # Read the Headway MT5 page and collect installer links from it.
+          try {
+            $page = Invoke-WebRequest "https://hw.online/mt5/" -UserAgent $ua -ErrorAction Stop
+            $content = $page.Content -replace '\\/', '/'
+            Write-Host "Headway page fetched, $($content.Length) characters"
+            $absolute = [regex]::Matches($content, 'https?://[^"''\s<>\\]+') | ForEach-Object { $_.Value } | Where-Object { $_ -match '\.exe' -or $_ -match 'download\.mql5\.com' } | Select-Object -Unique
+            foreach ($u in $absolute) { Write-Host "Link on page: $u"; $candidates += $u }
+            foreach ($m in [regex]::Matches($content, '["'']([^"''\s<>]+\.exe[^"''\s<>]*)["'']')) {
+              $u = ([uri]::new([uri]"https://hw.online/mt5/", $m.Groups[1].Value)).AbsoluteUri
+              Write-Host "Relative link on page: $u"
+              $candidates += $u
+            }
+          } catch {
+            Write-Host "Could not read the Headway page: $_"
+          }
+
           $candidates += @(
             "https://download.mql5.com/cdn/web/headway.ltd/mt5/headway5setup.exe",
-            "https://download.mql5.com/cdn/web/headway.limited/mt5/headway5setup.exe",
-            "https://download.mql5.com/cdn/web/headway.com/mt5/headway5setup.exe",
-            "https://download.mql5.com/cdn/web/headway.group/mt5/headway5setup.exe"
+            "https://download.mql5.com/cdn/web/headway.limited/mt5/headway5setup.exe"
           )
-          $found = $false
-          foreach ($url in $candidates) {
+
+          $ok = $false
+          foreach ($url in ($candidates | Select-Object -Unique)) {
             try {
-              Invoke-WebRequest $url -OutFile $installer -ErrorAction Stop
-              if ((Get-Item $installer).Length -gt 500KB) {
+              Invoke-WebRequest $url -OutFile $installer -UserAgent $ua -ErrorAction Stop
+              $bytes = [System.IO.File]::ReadAllBytes($installer)
+              if ($bytes.Length -gt 500KB -and $bytes[0] -eq 0x4D -and $bytes[1] -eq 0x5A) {
                 Write-Host "Using installer: $url"
-                $found = $true
+                $ok = $true
                 break
               }
+              Write-Host "Not an installer: $url"
             } catch {
               Write-Host "Not available: $url"
             }
           }
-          if (-not $found) {
-            Write-Host "No Headway installer found. Using the generic MetaQuotes installer; the server secret must then be an IP address."
-            Invoke-WebRequest "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
+
+          if (-not $ok) {
+            if ($env:MT5_SERVER -match '^\d{1,3}(\.\d{1,3}){3}') {
+              Write-Host "No Headway installer found. The server is an IP address, so using the generic MetaQuotes installer."
+              Invoke-WebRequest "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
+            } else {
+              throw "No Headway installer found and MT5_SERVER is a name, not an IP address. Set the repo variable MT5_INSTALLER_URL to Headway's installer link, or set the MT5_SERVER secret to the server IP address."
+            }
           }
+
           New-Item -ItemType Directory -Path "C:\MT5" -Force | Out-Null
           Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait
           if (-not (Test-Path "C:\MT5\terminal64.exe")) { throw "terminal64.exe not found in C:\MT5" }
@@ -102,23 +128,31 @@ jobs:
           $before = Get-SyncCount
           $proc = Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList @("/portable", "/config:$ini") -PassThru
           Write-Host "Terminal started. PID=$($proc.Id)"
+          $synced = $false
           for ($i = 1; $i -le 36; $i++) {
             Start-Sleep -Seconds 5
             if ((Get-SyncCount) -gt $before) {
               Write-Host "Terminal synchronized after $($i * 5) seconds"
+              $synced = $true
               break
             }
           }
           Start-Sleep -Seconds 10
 
-          python mt5_signal_trade.py
-          $code = $LASTEXITCODE
-
           Write-Host "===== TERMINAL NETWORK LINES ====="
           $tlog = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if ($tlog) {
-            Get-Content -LiteralPath $tlog.FullName | Select-String -Pattern "Network|authoriz|synchronized" | Select-Object -Last 12 | ForEach-Object { Write-Host $_.Line }
+            Get-Content -LiteralPath $tlog.FullName | Select-String -Pattern "Network|authoriz|synchronized|invalid|failed" | Select-Object -Last 12 | ForEach-Object { Write-Host $_.Line }
           }
+
+          if (-not $synced) {
+            Write-Host "RESULT: the terminal never connected to the broker, so no trade was attempted"
+            Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+
+          python mt5_signal_trade.py
+          $code = $LASTEXITCODE
 
           Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
           exit $code
