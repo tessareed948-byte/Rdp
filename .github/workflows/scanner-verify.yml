@@ -1,12 +1,9 @@
 name: XAU Scanner Verify
 
 # Read-only check of the Python port of the Xau scalper indicator.
-# Pulls gold candles from the broker terminal, runs the 1h and 45m scanners, compares the
-# signals with your chart examples and prints back-test statistics. No orders are sent.
-# Runs automatically on every push to the xau-scanner branch, or by hand.
+# Pulls gold candles from the broker terminal and runs the studies in verify_scanner.py.
+# No orders are sent. Start it by hand with Run workflow.
 on:
-  push:
-    branches: [xau-scanner]
   workflow_dispatch:
 
 jobs:
