@@ -1,0 +1,109 @@
+name: XAU Scan Demo
+
+# Hourly scan of the Xau scalper port (1h chart) on a Deriv DEMO account.
+# A signal opens one market trade: stop 1.5 x ATR, target 2 x the stop, risk RISK_PCT of the balance.
+# The script refuses to trade any account that is not a demo account.
+#
+# Needs these repo secrets (Deriv demo account): DERIV_LOGIN, DERIV_PASSWORD, DERIV_SERVER
+# Optional repo variables: RISK_PCT (default 1), SL_ATR (default 1.5), RR (default 2), XAU_MAX_LOTS (default 1)
+#
+# Scheduled runs only start from the default branch, so merge this branch into main to switch the
+# schedule on. Pushes to the xau-scanner branch run one scan right away for testing.
+on:
+  schedule:
+    - cron: "3 6-20 * * 1-5"
+  workflow_dispatch:
+  push:
+    branches: [xau-scanner]
+
+concurrency:
+  group: xau-scan-demo
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: windows-2022
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install MetaTrader5==5.0.6231 pandas numpy tzdata
+
+      - name: Install the Deriv terminal
+        shell: pwsh
+        env:
+          DERIV_LOGIN: ${{ secrets.DERIV_LOGIN }}
+        run: |
+          if (-not "$env:DERIV_LOGIN".Trim()) { throw "Add the repo secrets DERIV_LOGIN, DERIV_PASSWORD and DERIV_SERVER (the Deriv demo account)." }
+          $installer = Join-Path $env:TEMP "deriv5setup.exe"
+          Invoke-WebRequest "https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe" -OutFile $installer -ErrorAction Stop
+          New-Item -ItemType Directory -Path "C:\MT5" -Force | Out-Null
+          Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait
+          if (-not (Test-Path "C:\MT5\terminal64.exe")) { throw "terminal64.exe not found in C:\MT5" }
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
+
+      - name: Connect and scan
+        shell: pwsh
+        env:
+          MT5_LOGIN: ${{ secrets.DERIV_LOGIN }}
+          MT5_PASSWORD: ${{ secrets.DERIV_PASSWORD }}
+          MT5_SERVER: ${{ secrets.DERIV_SERVER }}
+          MT5_TERMINAL_PATH: 'C:\MT5\terminal64.exe'
+          RISK_PCT: ${{ vars.RISK_PCT || '1' }}
+          SL_ATR: ${{ vars.SL_ATR || '1.5' }}
+          RR: ${{ vars.RR || '2' }}
+          MAX_LOTS: ${{ vars.XAU_MAX_LOTS || '1' }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          function Get-SyncCount {
+            $f = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $f) { return 0 }
+            return @(Get-Content -LiteralPath $f.FullName | Select-String -Pattern "terminal synchronized with").Count
+          }
+
+          $ini = "C:\mt5_login.ini"
+          @(
+            "[Common]"
+            "Login=$("$env:MT5_LOGIN".Trim())"
+            "Password=$("$env:MT5_PASSWORD".Trim())"
+            "Server=$("$env:MT5_SERVER".Trim())"
+            "[Experts]"
+            "Enabled=1"
+            "AllowLiveTrading=1"
+          ) | Set-Content -LiteralPath $ini -Encoding ASCII
+
+          $before = Get-SyncCount
+          $proc = Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList @("/portable", "/config:$ini") -PassThru
+          Write-Host "Terminal started. PID=$($proc.Id)"
+          $synced = $false
+          for ($i = 1; $i -le 36; $i++) {
+            Start-Sleep -Seconds 5
+            if ((Get-SyncCount) -gt $before) {
+              Write-Host "Terminal synchronized after $($i * 5) seconds"
+              $synced = $true
+              break
+            }
+          }
+          if (-not $synced) {
+            Write-Host "RESULT: the terminal never connected to the broker"
+            Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Start-Sleep -Seconds 10
+
+          python xau_live.py
+          $code = $LASTEXITCODE
+
+          Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
+          exit $code
