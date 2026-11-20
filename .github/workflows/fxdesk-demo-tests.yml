@@ -1,0 +1,27 @@
+name: FX Desk demo executor tests
+on:
+  push:
+    branches: [feat/fxdesk-demo-execution-20261120]
+    paths:
+      - "fxdesk_demo_executor.py"
+      - "test_fxdesk_demo_executor.py"
+      - ".github/workflows/fxdesk-demo-tests.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "fxdesk_demo_executor.py"
+      - "test_fxdesk_demo_executor.py"
+      - ".github/workflows/fxdesk-demo-tests.yml"
+permissions:
+  contents: read
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pytest
+      - run: python -m py_compile fxdesk_demo_executor.py
+      - run: python -m pytest -q test_fxdesk_demo_executor.py
