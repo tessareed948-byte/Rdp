@@ -1,0 +1,140 @@
+name: MT5 Signal Trade
+
+# Trades ONE signal on the configured MT5 account.
+# Start it from your scanner (GitHub API) or by hand with Run workflow.
+# Broker settings live in repo secrets and variables, so switching broker needs no code change:
+#   secrets   MT5_LOGIN, MT5_PASSWORD, MT5_SERVER
+#   variables MT5_INSTALLER_URL (the broker's own MT5 installer), ALLOW_LIVE, MAX_LOTS
+# The default installer is Headway's. Real accounts need the variable ALLOW_LIVE set to true.
+on:
+  repository_dispatch:
+    types: [mt5-signal]
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Symbol such as EURUSD, or AUTO to pick one the free margin can carry"
+        required: true
+        default: "AUTO"
+      side:
+        description: "Direction"
+        required: true
+        type: choice
+        options:
+          - buy
+          - sell
+      lots:
+        description: "Lot size (capped by MAX_LOTS)"
+        required: false
+        default: "0.01"
+      sl:
+        description: "Stop loss price (optional)"
+        required: false
+        default: ""
+      tp:
+        description: "Take profit price (optional)"
+        required: false
+        default: ""
+      signal_id:
+        description: "Unique signal ID, so the same signal is never traded twice"
+        required: false
+        default: ""
+
+concurrency:
+  group: mt5-signal-${{ github.event.client_payload.signal_id || inputs.signal_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  trade:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install MetaTrader5==5.0.6231
+
+      - name: Install the broker MetaTrader 5 terminal
+        shell: pwsh
+        env:
+          MT5_INSTALLER_URL: ${{ vars.MT5_INSTALLER_URL || 'https://download.mql5.com/cdn/web/jarocel.pty.ltd/mt5/headway5setup.exe' }}
+        run: |
+          $installer = Join-Path $env:TEMP "mt5installer.exe"
+          $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+          Invoke-WebRequest $env:MT5_INSTALLER_URL -OutFile $installer -UserAgent $ua -ErrorAction Stop
+          $bytes = [System.IO.File]::ReadAllBytes($installer)
+          if (-not ($bytes.Length -gt 500KB -and $bytes[0] -eq 0x4D -and $bytes[1] -eq 0x5A)) { throw "The downloaded file is not an installer" }
+          New-Item -ItemType Directory -Path "C:\MT5" -Force | Out-Null
+          Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait
+          if (-not (Test-Path "C:\MT5\terminal64.exe")) { throw "terminal64.exe not found in C:\MT5" }
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
+
+      - name: Connect and trade the signal
+        shell: pwsh
+        env:
+          MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
+          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+          MT5_TERMINAL_PATH: 'C:\MT5\terminal64.exe'
+          ALLOW_LIVE: ${{ vars.ALLOW_LIVE || 'false' }}
+          MAX_LOTS: ${{ vars.MAX_LOTS || '0.01' }}
+          SIG_SYMBOL: ${{ github.event.client_payload.symbol || inputs.symbol }}
+          SIG_SIDE: ${{ github.event.client_payload.side || inputs.side }}
+          SIG_LOTS: ${{ github.event.client_payload.lots || inputs.lots }}
+          SIG_SL: ${{ github.event.client_payload.sl || inputs.sl }}
+          SIG_TP: ${{ github.event.client_payload.tp || inputs.tp }}
+          SIG_ID: ${{ github.event.client_payload.signal_id || inputs.signal_id }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          function Get-SyncCount {
+            $f = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $f) { return 0 }
+            return @(Get-Content -LiteralPath $f.FullName | Select-String -Pattern "terminal synchronized with").Count
+          }
+
+          # Algorithmic trading must be switched on, otherwise the terminal rejects API orders.
+          # Credentials are trimmed because pasted secrets often end with a stray space.
+          $ini = "C:\mt5_login.ini"
+          @(
+            "[Common]"
+            "Login=$("$env:MT5_LOGIN".Trim())"
+            "Password=$("$env:MT5_PASSWORD".Trim())"
+            "Server=$("$env:MT5_SERVER".Trim())"
+            "[Experts]"
+            "Enabled=1"
+            "AllowLiveTrading=1"
+          ) | Set-Content -LiteralPath $ini -Encoding ASCII
+
+          $before = Get-SyncCount
+          $proc = Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList @("/portable", "/config:$ini") -PassThru
+          Write-Host "Terminal started. PID=$($proc.Id)"
+          $synced = $false
+          for ($i = 1; $i -le 36; $i++) {
+            Start-Sleep -Seconds 5
+            if ((Get-SyncCount) -gt $before) {
+              Write-Host "Terminal synchronized after $($i * 5) seconds"
+              $synced = $true
+              break
+            }
+          }
+          if (-not $synced) {
+            Write-Host "RESULT: the terminal never connected to the broker, so no trade was attempted"
+            Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Start-Sleep -Seconds 10
+
+          python mt5_signal_trade.py
+          $code = $LASTEXITCODE
+
+          Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
+          exit $code
