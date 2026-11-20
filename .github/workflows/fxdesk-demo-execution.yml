@@ -55,7 +55,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install MetaTrader5==5.0.4874 pytest
+          python -m pip install MetaTrader5==5.0.6231 pytest
       - name: Compile and run safety tests
         shell: pwsh
         run: |
@@ -110,18 +110,46 @@ jobs:
           "MT5_TERMINAL_PATH=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "MT5 terminal verified at: $terminal"
 
-      - name: Run original MT5 initialize/login method (no manual terminal launch)
+      - name: Start MT5 terminal and wait for broker synchronization
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $terminal = $env:MT5_TERMINAL_PATH
+          if (-not (Test-Path -LiteralPath $terminal)) {
+            throw "Expected MT5 terminal not found at $terminal"
+          }
+
+          # Follow the proven working runner sequence: start the installed
+          # terminal first, allow it to synchronize, then connect from Python.
+          $existing = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -eq $terminal }
+          if (-not $existing) {
+            $proc = Start-Process -FilePath $terminal -PassThru
+            Write-Host "Terminal started. PID=$($proc.Id)"
+          } else {
+            Write-Host "Terminal already running. PID(s)=$($existing.ProcessId -join ', ')"
+          }
+
+          $running = $null
+          for ($i = 0; $i -lt 24; $i++) {
+            Start-Sleep -Seconds 5
+            $running = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { $_.ExecutablePath -eq $terminal }
+            if ($running) { break }
+          }
+          if (-not $running) { throw "MT5 terminal did not remain running." }
+
+          Start-Sleep -Seconds 70
+          Write-Host "Terminal synchronized after 70 seconds."
+
+      - name: Run Python connection check or guarded signal execution
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $resultPath = Join-Path $env:GITHUB_WORKSPACE "fxdesk-execution-result.json"
 
-          # Do not Start-Process terminal64.exe, pass /portable, or write a custom
-          # terminal INI here. The original working Python script lets
-          # MetaTrader5.initialize(path, login, password, server) start/attach
-          # using the exact original connection method.
           if ([string]::IsNullOrWhiteSpace($env:SIGNAL_PAYLOAD)) {
-            Write-Host "No signal payload: original-method Deriv DEMO connection check only; no order can be sent."
+            Write-Host "No signal payload: connection check only; no order can be sent."
             $output = & python fxdesk_demo_executor.py --self-test 2>&1
           } else {
             $output = & python fxdesk_demo_executor.py 2>&1
