@@ -16,9 +16,10 @@ from datetime import datetime, timedelta, timezone
 import MetaTrader5 as mt5
 
 TERMINAL = os.environ["MT5_TERMINAL_PATH"]
-LOGIN = int(os.environ["MT5_LOGIN"])
-PASSWORD = os.environ["MT5_PASSWORD"]
-SERVER = os.environ["MT5_SERVER"]
+# Pasted secrets often carry a stray space or newline at the end, so trim them.
+LOGIN = int(os.environ["MT5_LOGIN"].strip())
+PASSWORD = os.environ["MT5_PASSWORD"].strip()
+SERVER = os.environ["MT5_SERVER"].strip()
 
 ALLOW_LIVE = os.getenv("ALLOW_LIVE", "false").strip().lower() == "true"
 MAX_LOTS = float(os.getenv("MAX_LOTS", "").strip() or "0.01")
@@ -76,10 +77,15 @@ print(f"Signal: {side} {symbol_in} lots<={lots} sl={sl} tp={tp} id={signal_id}")
 if not mt5.initialize(path=TERMINAL, portable=True, timeout=120000):
     print("FAILED: initialize ->", mt5.last_error())
     sys.exit(1)
-if not mt5.login(LOGIN, password=PASSWORD, server=SERVER, timeout=60000):
-    done(1, f"FAILED: login -> {mt5.last_error()}")
 
+# The terminal already logged in from its start-up config. Only log in again
+# from Python if it is not on the configured account, to avoid a needless re-authorization.
 account = mt5.account_info()
+if account is None or account.login != LOGIN:
+    print("Terminal is not on the configured account yet, logging in from Python")
+    if not mt5.login(LOGIN, password=PASSWORD, server=SERVER, timeout=60000):
+        done(1, f"FAILED: login -> {mt5.last_error()}")
+    account = mt5.account_info()
 if account is None or account.login != LOGIN:
     done(1, "FAILED: connected account does not match the configured login")
 
