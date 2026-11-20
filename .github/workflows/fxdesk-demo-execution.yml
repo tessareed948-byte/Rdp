@@ -1,6 +1,11 @@
 name: FX Desk Deriv DEMO execution
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/fxdesk-demo-execution.yml"
+      - "fxdesk_demo_executor.py"
   workflow_dispatch:
     inputs:
       signal_key:
