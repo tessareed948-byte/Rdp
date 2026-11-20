@@ -1,0 +1,101 @@
+name: FX Desk Deriv DEMO execution
+
+on:
+  workflow_dispatch:
+    inputs:
+      signal_key:
+        description: Stable signal fingerprint from Aurora Telegram bot
+        required: false
+        type: string
+      signal_payload:
+        description: Normalized FX Desk signal JSON
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fxdesk-demo-${{ inputs.signal_key || github.run_id }} 
+  cancel-in-progress: false
+
+jobs:
+  execute-one-demo-signal:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
+      MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
+      MT5_SERVER: ${{ secrets.MT5_SERVER }}
+      MT5_TERMINAL_PATH: C:\MT5\terminal64.exe
+      MT5_SYMBOL_MAP: ${{ secrets.MT5_SYMBOL_MAP }}
+      DEMO_ONLY: "true"
+      ALLOW_DEMO_TRADING: "true"
+      MAX_RISK_PERCENT: "0.25"
+      MAX_ENTRY_DEVIATION_POINTS: "100"
+      MT5_MAGIC: "20261120"
+      SIGNAL_KEY: ${{ inputs.signal_key }}
+      SIGNAL_PAYLOAD: ${{ inputs.signal_payload }}
+
+    steps:
+      - name: Checkout isolated executor
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install MetaTrader5==5.0.4874 pytest
+      - name: Compile and run safety tests
+        shell: pwsh
+        run: |
+          python -m py_compile fxdesk_demo_executor.py
+          python -m pytest -q test_fxdesk_demo_executor.py
+          if ($LASTEXITCODE -ne 0) { throw "Executor safety tests failed." }
+      - name: Validate configured Deriv demo account
+        shell: pwsh
+        run: |
+          foreach ($name in @("MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER")) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "Missing Actions secret: $name" }
+          }
+          if ($env:DEMO_ONLY -ne "true" -or $env:ALLOW_DEMO_TRADING -ne "true") { throw "Unsafe workflow configuration." }
+          if ($env:MT5_SERVER -notmatch "(?i)deriv") { throw "Configured server is not identified as Deriv." }
+      - name: Install MT5 terminal
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Join-Path $env:TEMP "mt5setup.exe"
+          Invoke-WebRequest "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
+          if ((Get-Item $installer).Length -lt 1000000) { throw "MT5 installer download is unexpectedly small." }
+          New-Item -ItemType Directory -Path "C:\MT5" -Force | Out-Null
+          Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait
+          if (-not (Test-Path "C:\MT5\terminal64.exe")) { throw "MT5 terminal install could not be verified." }
+      - name: Start terminal with live trading disabled
+        shell: pwsh
+        run: |
+          $ini = "C:\mt5-fxdesk-demo.ini"
+          @("[Common]","Login=$env:MT5_LOGIN","Password=$env:MT5_PASSWORD","Server=$env:MT5_SERVER","[Experts]","Enabled=1","AllowLiveTrading=0") | Set-Content -LiteralPath $ini -Encoding ASCII
+          Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList @("/portable", "/config:$ini") | Out-Null
+          $running = $false
+          for ($i=0; $i -lt 24; $i++) { Start-Sleep -Seconds 5; if (Get-Process terminal64 -ErrorAction SilentlyContinue) { $running=$true; break } }
+          if (-not $running) { throw "MT5 terminal did not start." }
+      - name: Execute one FX Desk signal or no-order connection test
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNAL_PAYLOAD)) {
+            Write-Host "No signal payload: connection check only; no order can be sent."
+            python fxdesk_demo_executor.py --self-test
+          } else {
+            python fxdesk_demo_executor.py
+          }
+          if ($LASTEXITCODE -ne 0) { throw "FX Desk demo executor failed." }
+      - name: Shut down runner terminal
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
+          Remove-Item "C:\mt5-fxdesk-demo.ini" -Force -ErrorAction SilentlyContinue
+          Write-Host "Runner/MT5 session released. Broker-side demo SL/TP remains active."
