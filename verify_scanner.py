@@ -8,7 +8,7 @@ import time
 import MetaTrader5 as mt5
 import pandas as pd
 
-from scanner_report import CONFIGS, analyse
+from scanner_report import CONFIGS, analyse, entry_method_table, search_example
 
 TERMINAL = os.environ["MT5_TERMINAL_PATH"]
 SYMBOL = os.getenv("SCAN_SYMBOL", "XAUUSD").strip()
@@ -90,4 +90,13 @@ for label, minutes, anchor in CONFIGS:
     if minutes == 45 and (close, near) > best[1:]:
         best = (label, close, near)
 print(f"Best 45m alignment against your examples: {best[0]} ({best[1]}/5 within $2, {best[2]}/5 within $5)")
+print()
+
+# How the entry method changes the result, per accuracy mode (1h and the best 45m alignment).
+for cfg in (CONFIGS[0], CONFIGS[2]):
+    print("\n".join(entry_method_table(m15, *cfg)))
+    print()
+
+# The one example that did not match: look for it under every option.
+print("\n".join(search_example(m15, "buy", 3941.842)))
 mt5.shutdown()
