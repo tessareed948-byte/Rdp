@@ -41,6 +41,8 @@ jobs:
       MT5_MAGIC: "20261120"
       SIGNAL_KEY: ${{ inputs.signal_key }}
       SIGNAL_PAYLOAD: ${{ inputs.signal_payload }}
+      FXDESK_CALLBACK_URL: ${{ secrets.FXDESK_CALLBACK_URL }}
+      FXDESK_CALLBACK_SECRET: ${{ secrets.FXDESK_CALLBACK_SECRET }}
 
     steps:
       - name: Checkout isolated executor
@@ -68,6 +70,14 @@ jobs:
           }
           if ($env:DEMO_ONLY -ne "true" -or $env:ALLOW_DEMO_TRADING -ne "true") { throw "Unsafe workflow configuration." }
           if ($env:MT5_SERVER -notmatch "(?i)deriv") { throw "Configured server is not identified as Deriv." }
+      - name: Require result callback for every signal execution
+        if: ${{ inputs.signal_payload != '' }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:FXDESK_CALLBACK_URL) -or
+              [string]::IsNullOrWhiteSpace($env:FXDESK_CALLBACK_SECRET)) {
+            throw "Signal execution is blocked until FXDESK_CALLBACK_URL and FXDESK_CALLBACK_SECRET are configured."
+          }
       - name: Install MT5 terminal
         shell: pwsh
         run: |
@@ -162,13 +172,69 @@ jobs:
       - name: Execute one FX Desk signal or no-order connection test
         shell: pwsh
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:SIGNAL_PAYLOAD)) {
-            Write-Host "No signal payload: connection check only; no order can be sent."
-            python fxdesk_demo_executor.py --self-test
-          } else {
-            python fxdesk_demo_executor.py
+          $ErrorActionPreference = "Stop"
+          $resultPath = Join-Path $env:GITHUB_WORKSPACE "fxdesk-execution-result.json"
+          $exitCode = 0
+          $output = @()
+          try {
+            if ([string]::IsNullOrWhiteSpace($env:SIGNAL_PAYLOAD)) {
+              Write-Host "No signal payload: connection check only; no order can be sent."
+              $output = & python fxdesk_demo_executor.py --self-test 2>&1
+            } else {
+              $output = & python fxdesk_demo_executor.py 2>&1
+            }
+            $pythonExit = $LASTEXITCODE
+            $output | ForEach-Object { Write-Host $_ }
+            $resultLine = $output | Where-Object { "$_" -like "EXECUTION_RESULT=*" } | Select-Object -Last 1
+            if ($resultLine) {
+              $json = "$resultLine".Substring("EXECUTION_RESULT=".Length)
+              $json | Set-Content -LiteralPath $resultPath -Encoding UTF8
+            } else {
+              $details = ($output | ForEach-Object { "$_" }) -join " "
+              $failure = @{
+                status = "failed"
+                demo = $false
+                order_sent = $false
+                error = $details.Substring(0, [Math]::Min(500, $details.Length))
+              } | ConvertTo-Json -Compress
+              $failure | Set-Content -LiteralPath $resultPath -Encoding UTF8
+            }
+            if ($pythonExit -ne 0) { $exitCode = $pythonExit }
+          } catch {
+            $exitCode = 1
+            $failure = @{
+              status = "failed"
+              demo = $false
+              order_sent = $false
+              error = $_.Exception.Message.Substring(0, [Math]::Min(500, $_.Exception.Message.Length))
+            } | ConvertTo-Json -Compress
+            $failure | Set-Content -LiteralPath $resultPath -Encoding UTF8
           }
-          if ($LASTEXITCODE -ne 0) { throw "FX Desk demo executor failed." }
+          "FXDESK_EXECUTOR_EXIT_CODE=$exitCode" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if ($exitCode -ne 0) { throw "FX Desk demo executor failed with exit code $exitCode." }
+
+      - name: Send execution result to Aurora Telegram
+        if: ${{ always() && inputs.signal_payload != '' }}
+        shell: pwsh
+        run: |
+          $resultPath = Join-Path $env:GITHUB_WORKSPACE "fxdesk-execution-result.json"
+          if (Test-Path -LiteralPath $resultPath) {
+            $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+          } else {
+            $result = @{
+              status = "runner_failed_before_executor"
+              demo = $false
+              order_sent = $false
+              error = "The runner stopped before the executor produced a result."
+            }
+          }
+          $body = @{
+            fingerprint = $env:SIGNAL_KEY
+            result = $result
+          } | ConvertTo-Json -Depth 8 -Compress
+          Invoke-RestMethod -Uri $env:FXDESK_CALLBACK_URL -Method Post -Headers @{ "X-FXDesk-Callback-Secret" = $env:FXDESK_CALLBACK_SECRET } -ContentType "application/json" -Body $body | Out-Null
+          Write-Host "Execution outcome delivered to Aurora Telegram monitoring endpoint."
+
       - name: Shut down runner terminal
         if: always()
         shell: pwsh
