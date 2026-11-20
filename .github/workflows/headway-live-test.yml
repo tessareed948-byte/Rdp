@@ -3,6 +3,7 @@ name: Headway Live Test
 # ONE-TIME live test on the Headway account, started by the owner's request.
 # Runs on every push to the headway-live-test branch. The fixed signal ID means a
 # second run will skip instead of trading again. The main workflow stays gated by ALLOW_LIVE.
+# Credentials are read from HEADWAY_* secrets if they exist, otherwise from MT5_* secrets.
 on:
   push:
     branches: [headway-live-test]
@@ -30,63 +31,17 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install MetaTrader5==5.0.6231
 
-      - name: Find and install the broker terminal
+      - name: Install the Headway terminal
         shell: pwsh
         env:
-          MT5_INSTALLER_URL: ${{ vars.MT5_INSTALLER_URL }}
-          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+          MT5_INSTALLER_URL: ${{ vars.MT5_INSTALLER_URL || 'https://download.mql5.com/cdn/web/jarocel.pty.ltd/mt5/headway5setup.exe' }}
         run: |
           $installer = Join-Path $env:TEMP "mt5installer.exe"
           $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-          $candidates = @()
-          if ($env:MT5_INSTALLER_URL) { $candidates += $env:MT5_INSTALLER_URL }
-
-          # Read the Headway MT5 page and collect installer links from it.
-          try {
-            $page = Invoke-WebRequest "https://hw.online/mt5/" -UserAgent $ua -ErrorAction Stop
-            $content = $page.Content -replace '\\/', '/'
-            Write-Host "Headway page fetched, $($content.Length) characters"
-            $absolute = [regex]::Matches($content, 'https?://[^"''\s<>\\]+') | ForEach-Object { $_.Value } | Where-Object { $_ -match '\.exe' -or $_ -match 'download\.mql5\.com' } | Select-Object -Unique
-            foreach ($u in $absolute) { Write-Host "Link on page: $u"; $candidates += $u }
-            foreach ($m in [regex]::Matches($content, '["'']([^"''\s<>]+\.exe[^"''\s<>]*)["'']')) {
-              $u = ([uri]::new([uri]"https://hw.online/mt5/", $m.Groups[1].Value)).AbsoluteUri
-              Write-Host "Relative link on page: $u"
-              $candidates += $u
-            }
-          } catch {
-            Write-Host "Could not read the Headway page: $_"
-          }
-
-          $candidates += @(
-            "https://download.mql5.com/cdn/web/headway.ltd/mt5/headway5setup.exe",
-            "https://download.mql5.com/cdn/web/headway.limited/mt5/headway5setup.exe"
-          )
-
-          $ok = $false
-          foreach ($url in ($candidates | Select-Object -Unique)) {
-            try {
-              Invoke-WebRequest $url -OutFile $installer -UserAgent $ua -ErrorAction Stop
-              $bytes = [System.IO.File]::ReadAllBytes($installer)
-              if ($bytes.Length -gt 500KB -and $bytes[0] -eq 0x4D -and $bytes[1] -eq 0x5A) {
-                Write-Host "Using installer: $url"
-                $ok = $true
-                break
-              }
-              Write-Host "Not an installer: $url"
-            } catch {
-              Write-Host "Not available: $url"
-            }
-          }
-
-          if (-not $ok) {
-            if ($env:MT5_SERVER -match '^\d{1,3}(\.\d{1,3}){3}') {
-              Write-Host "No Headway installer found. The server is an IP address, so using the generic MetaQuotes installer."
-              Invoke-WebRequest "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
-            } else {
-              throw "No Headway installer found and MT5_SERVER is a name, not an IP address. Set the repo variable MT5_INSTALLER_URL to Headway's installer link, or set the MT5_SERVER secret to the server IP address."
-            }
-          }
-
+          Invoke-WebRequest $env:MT5_INSTALLER_URL -OutFile $installer -UserAgent $ua -ErrorAction Stop
+          $bytes = [System.IO.File]::ReadAllBytes($installer)
+          if (-not ($bytes.Length -gt 500KB -and $bytes[0] -eq 0x4D -and $bytes[1] -eq 0x5A)) { throw "The downloaded file is not an installer" }
+          Write-Host "Installer downloaded: $($bytes.Length) bytes"
           New-Item -ItemType Directory -Path "C:\MT5" -Force | Out-Null
           Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait
           if (-not (Test-Path "C:\MT5\terminal64.exe")) { throw "terminal64.exe not found in C:\MT5" }
@@ -95,9 +50,9 @@ jobs:
       - name: Connect and place one live test trade
         shell: pwsh
         env:
-          MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
-          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
-          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+          MT5_LOGIN: ${{ secrets.HEADWAY_LOGIN || secrets.MT5_LOGIN }}
+          MT5_PASSWORD: ${{ secrets.HEADWAY_PASSWORD || secrets.MT5_PASSWORD }}
+          MT5_SERVER: ${{ secrets.HEADWAY_SERVER || secrets.MT5_SERVER }}
           MT5_TERMINAL_PATH: 'C:\MT5\terminal64.exe'
           ALLOW_LIVE: "true"
           MAX_LOTS: "0.01"
@@ -107,6 +62,10 @@ jobs:
           SIG_ID: "headway-test-1"
         run: |
           $ErrorActionPreference = "Continue"
+
+          # Safe checks only: lengths and yes/no answers, never the values.
+          Write-Host "Login length: $("$env:MT5_LOGIN".Length); password length: $("$env:MT5_PASSWORD".Length)"
+          Write-Host "Server mentions headway: $("$env:MT5_SERVER".ToLower().Contains('headway')); server is an IP address: $("$env:MT5_SERVER" -match '^\d{1,3}(\.\d{1,3}){3}')"
 
           function Get-SyncCount {
             $f = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -139,11 +98,9 @@ jobs:
           }
           Start-Sleep -Seconds 10
 
-          Write-Host "===== TERMINAL NETWORK LINES ====="
+          Write-Host "===== TERMINAL LOG, LAST 20 LINES ====="
           $tlog = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if ($tlog) {
-            Get-Content -LiteralPath $tlog.FullName | Select-String -Pattern "Network|authoriz|synchronized|invalid|failed" | Select-Object -Last 12 | ForEach-Object { Write-Host $_.Line }
-          }
+          if ($tlog) { Get-Content -LiteralPath $tlog.FullName -Tail 20 | ForEach-Object { Write-Host $_ } } else { Write-Host "No terminal log found" }
 
           if (-not $synced) {
             Write-Host "RESULT: the terminal never connected to the broker, so no trade was attempted"
