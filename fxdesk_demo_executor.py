@@ -78,33 +78,19 @@ def execute(signal_payload: str, signal_key: str = "", self_test: bool = False) 
     terminal_path = _required("MT5_TERMINAL_PATH")
     if not os.path.isfile(terminal_path):
         raise RuntimeError("MT5_TERMINAL_PATH does not point to the installed terminal executable")
-    # Exact attach mode used by the proven MT5 Python Demo Trade script.
-    # Keep the same portable data folder and retry IPC without shutting down.
-    initialized, init_error = False, None
-    for attempt in range(1, 6):
-        initialized = mt5.initialize(path=terminal_path, portable=True, timeout=120000)
-        if initialized:
-            break
-        init_error = mt5.last_error()
-        log.warning("MT5 initialize/IPC attempt %s/5 failed: %s", attempt, init_error)
-        if attempt < 5:
-            import time
-            time.sleep(20)
+    # Use the exact initialization/login method from the original working
+    # demo_gold_test_order.py and mt5_bridge.py. No portable=True and no
+    # separate initialize-then-login retry loop.
+    initialized = mt5.initialize(
+        terminal_path,
+        login=login,
+        password=password,
+        server=server,
+        timeout=60000,
+    )
     if not initialized:
-        raise RuntimeError("MT5 initialize/IPC failed after 5 attempts: " + str(init_error))
+        raise RuntimeError("Original MT5 initialize/login method failed: " + str(mt5.last_error()))
     try:
-        logged_in, login_error = False, None
-        for attempt in range(1, 4):
-            logged_in = mt5.login(login, password=password, server=server, timeout=60000)
-            if logged_in:
-                break
-            login_error = mt5.last_error()
-            log.warning("Deriv demo login attempt %s/3 failed: %s", attempt, login_error)
-            if attempt < 3:
-                import time
-                time.sleep(15)
-        if not logged_in:
-            raise RuntimeError("MT5 Deriv login failed after 3 attempts: " + str(login_error))
         account, terminal = mt5.account_info(), mt5.terminal_info()
         if account is None or terminal is None or not terminal.connected:
             raise RuntimeError("MT5 terminal/account connection is not verified")
