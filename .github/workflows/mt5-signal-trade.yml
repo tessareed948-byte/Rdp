@@ -4,8 +4,9 @@ name: MT5 Signal Trade
 # Start it from your scanner (GitHub API) or by hand with Run workflow.
 # Broker settings live in repo secrets and variables, so switching broker needs no code change:
 #   secrets   MT5_LOGIN, MT5_PASSWORD, MT5_SERVER
-#   variables MT5_INSTALLER_URL (the broker's own MT5 installer), ALLOW_LIVE, MAX_LOTS
+#   variables MT5_INSTALLER_URL (the broker's own MT5 installer), ALLOW_LIVE, MAX_LOTS, MAX_RISK_PCT
 # The default installer is Headway's. Real accounts need the variable ALLOW_LIVE set to true.
+# Lot size: send "lots" for a fixed size, or "risk_pct" (needs "sl") to size from the stop loss.
 on:
   repository_dispatch:
     types: [mt5-signal]
@@ -23,15 +24,19 @@ on:
           - buy
           - sell
       lots:
-        description: "Lot size (capped by MAX_LOTS)"
+        description: "Fixed lot size (capped by MAX_LOTS)"
         required: false
-        default: "0.01"
+        default: ""
+      risk_pct:
+        description: "Percent of balance to risk, needs a stop loss (capped by MAX_RISK_PCT)"
+        required: false
+        default: ""
       sl:
-        description: "Stop loss price (optional)"
+        description: "Stop loss price"
         required: false
         default: ""
       tp:
-        description: "Take profit price (optional)"
+        description: "Take profit price"
         required: false
         default: ""
       signal_id:
@@ -86,9 +91,11 @@ jobs:
           MT5_TERMINAL_PATH: 'C:\MT5\terminal64.exe'
           ALLOW_LIVE: ${{ vars.ALLOW_LIVE || 'false' }}
           MAX_LOTS: ${{ vars.MAX_LOTS || '0.01' }}
+          MAX_RISK_PCT: ${{ vars.MAX_RISK_PCT || '2' }}
           SIG_SYMBOL: ${{ github.event.client_payload.symbol || inputs.symbol }}
           SIG_SIDE: ${{ github.event.client_payload.side || inputs.side }}
           SIG_LOTS: ${{ github.event.client_payload.lots || inputs.lots }}
+          SIG_RISK: ${{ github.event.client_payload.risk_pct || inputs.risk_pct }}
           SIG_SL: ${{ github.event.client_payload.sl || inputs.sl }}
           SIG_TP: ${{ github.event.client_payload.tp || inputs.tp }}
           SIG_ID: ${{ github.event.client_payload.signal_id || inputs.signal_id }}
