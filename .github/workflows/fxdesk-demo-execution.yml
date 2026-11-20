@@ -83,7 +83,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $installer = Join-Path $env:TEMP "mt5setup.exe"
-          Invoke-WebRequest "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
+          Invoke-WebRequest "https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe" -OutFile $installer
           if ((Get-Item $installer).Length -lt 1000000) { throw "MetaTrader installer download is unexpectedly small" }
 
           # Match the proven MT5 Python Demo Trade installation and path discovery.
@@ -119,15 +119,25 @@ jobs:
             throw "Expected MT5 terminal not found at $terminal"
           }
 
-          # Follow the proven working runner sequence: start the installed
-          # terminal first, allow it to synchronize, then connect from Python.
+          # Use the same Deriv portable-terminal login sequence as xau-scan-demo.yml.
+          $ini = "C:\mt5-fxdesk-demo.ini"
+          @(
+            "[Common]"
+            "Login=$("$env:MT5_LOGIN".Trim())"
+            "Password=$("$env:MT5_PASSWORD".Trim())"
+            "Server=$("$env:MT5_SERVER".Trim())"
+            "[Experts]"
+            "Enabled=1"
+            "AllowLiveTrading=1"
+          ) | Set-Content -LiteralPath $ini -Encoding ASCII
+
           $existing = Get-CimInstance Win32_Process -Filter "Name = 'terminal64.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.ExecutablePath -eq $terminal }
           if (-not $existing) {
-            $proc = Start-Process -FilePath $terminal -PassThru
-            Write-Host "Terminal started. PID=$($proc.Id)"
+            $proc = Start-Process -FilePath $terminal -ArgumentList @("/portable", "/config:$ini") -PassThru
+            Write-Host "Deriv terminal started. PID=$($proc.Id)"
           } else {
-            Write-Host "Terminal already running. PID(s)=$($existing.ProcessId -join ', ')"
+            Write-Host "Deriv terminal already running. PID(s)=$($existing.ProcessId -join ', ')"
           }
 
           $running = $null
