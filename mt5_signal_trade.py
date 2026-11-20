@@ -6,6 +6,7 @@ Safety rules enforced here:
   * lot size is capped by MAX_LOTS
   * the order is skipped if the required margin does not fit the free margin
   * a signal ID that was already traded (open position or recent deal) is skipped
+  * SIG_SYMBOL=AUTO picks the cheapest-margin major that the free margin can carry
 """
 import os
 import re
@@ -22,6 +23,9 @@ SERVER = os.environ["MT5_SERVER"]
 ALLOW_LIVE = os.getenv("ALLOW_LIVE", "false").strip().lower() == "true"
 MAX_LOTS = float(os.getenv("MAX_LOTS", "").strip() or "0.01")
 MAGIC = 20261118
+
+AUTO_BASES = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD",
+              "EURJPY", "GBPJPY", "EURGBP", "XAUUSD"]
 
 
 def summary(text):
@@ -64,13 +68,15 @@ lots = MAX_LOTS if lots is None else min(lots, MAX_LOTS)
 sl = number("sl", os.getenv("SIG_SL"))
 tp = number("tp", os.getenv("SIG_TP"))
 comment = f"sig-{signal_id}"[:31]
+is_buy = side == "buy"
+order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
 
 print(f"Signal: {side} {symbol_in} lots<={lots} sl={sl} tp={tp} id={signal_id}")
 
 if not mt5.initialize(path=TERMINAL, portable=True, timeout=120000):
     print("FAILED: initialize ->", mt5.last_error())
     sys.exit(1)
-if not mt5.login(LOGIN, password=PASSWORD, server=SERVER):
+if not mt5.login(LOGIN, password=PASSWORD, server=SERVER, timeout=60000):
     done(1, f"FAILED: login -> {mt5.last_error()}")
 
 account = mt5.account_info()
@@ -78,28 +84,14 @@ if account is None or account.login != LOGIN:
     done(1, "FAILED: connected account does not match the configured login")
 
 is_demo = account.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO
-print(f"Account mode: {'DEMO' if is_demo else 'REAL'}; free margin {account.margin_free} {account.currency}")
+print(f"Account mode: {'DEMO' if is_demo else 'REAL'}; currency {account.currency}; "
+      f"balance {account.balance}; free margin {account.margin_free}; leverage 1:{account.leverage}")
 if not is_demo and not ALLOW_LIVE:
-    done(1, "SAFETY STOP: this is a real account and the repo variable ALLOW_LIVE is not 'true'")
+    done(1, "SAFETY STOP: this is a real account and ALLOW_LIVE is not 'true'")
 
 terminal = mt5.terminal_info()
 if not terminal.trade_allowed:
     done(1, "FAILED: algorithmic trading is switched off in the terminal")
-
-# Resolve the symbol name (brokers add suffixes such as .0 or m).
-info = mt5.symbol_info(symbol_in)
-if info is None:
-    base = re.sub(r"[^A-Za-z0-9]", "", symbol_in)[:6]
-    candidates = [s.name for s in (mt5.symbols_get(f"*{base}*") or [])]
-    if not candidates:
-        done(1, f"FAILED: symbol {symbol_in} not found on this server")
-    symbol = candidates[0]
-    info = mt5.symbol_info(symbol)
-    print(f"Symbol {symbol_in} not found, using {symbol}")
-else:
-    symbol = symbol_in
-if not mt5.symbol_select(symbol, True):
-    done(1, f"FAILED: could not select {symbol}: {mt5.last_error()}")
 
 # Never trade the same signal twice.
 open_match = [p for p in (mt5.positions_get() or []) if comment in (p.comment or "")]
@@ -108,6 +100,61 @@ deals = mt5.history_deals_get(now - timedelta(days=3), now + timedelta(days=1)) 
 deal_match = [d for d in deals if comment in (d.comment or "")]
 if open_match or deal_match:
     done(0, f"SKIPPED: signal {signal_id} was already traded")
+
+
+def min_lot(info):
+    return max(info.volume_min, 0.0)
+
+
+def pick_auto_symbol():
+    """Cheapest-margin major whose minimum lot fits the free margin."""
+    names = [s.name for s in (mt5.symbols_get() or [])]
+    best = None
+    for base in AUTO_BASES:
+        matches = [n for n in names if n.upper().startswith(base)][:3]
+        for name in matches:
+            info = mt5.symbol_info(name)
+            if info is None or info.trade_mode != mt5.SYMBOL_TRADE_MODE_FULL:
+                continue
+            mt5.symbol_select(name, True)
+            tick = mt5.symbol_info_tick(name)
+            if tick is None or tick.ask <= 0:
+                continue
+            lot = min_lot(info)
+            if lot > MAX_LOTS:
+                print(f"  {name}: minimum lot {lot} is above MAX_LOTS")
+                continue
+            margin = mt5.order_calc_margin(order_type, name, lot, tick.ask if is_buy else tick.bid)
+            if margin is None:
+                continue
+            print(f"  candidate {name}: min lot {lot}, margin needed {margin:.4f} {account.currency}")
+            if margin <= account.margin_free * 0.95 and (best is None or margin < best[1]):
+                best = (name, margin)
+    return best
+
+
+if symbol_in.upper() == "AUTO":
+    print("Looking for a symbol that the free margin can carry...")
+    best = pick_auto_symbol()
+    if best is None:
+        done(3, f"SKIPPED: no major pair fits the free margin of {account.margin_free:.4f} "
+                f"{account.currency}. See the margin list above for what each needs.")
+    symbol = best[0]
+    print(f"Chosen symbol: {symbol} (margin {best[1]:.4f})")
+else:
+    symbol = symbol_in
+
+info = mt5.symbol_info(symbol)
+if info is None:
+    base = re.sub(r"[^A-Za-z0-9]", "", symbol)[:6]
+    candidates = [s.name for s in (mt5.symbols_get(f"*{base}*") or [])]
+    if not candidates:
+        done(1, f"FAILED: symbol {symbol} not found on this server")
+    print(f"Symbol {symbol} not found, using {candidates[0]}")
+    symbol = candidates[0]
+    info = mt5.symbol_info(symbol)
+if not mt5.symbol_select(symbol, True):
+    done(1, f"FAILED: could not select {symbol}: {mt5.last_error()}")
 
 tick = mt5.symbol_info_tick(symbol)
 if tick is None or tick.ask <= 0:
@@ -121,16 +168,13 @@ if info.volume_step > 0:
     lots = int(lots / info.volume_step + 1e-7) * info.volume_step
 lots = round(lots, 2)
 
-is_buy = side == "buy"
-order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
 price = tick.ask if is_buy else tick.bid
-
 margin = mt5.order_calc_margin(order_type, symbol, lots, price)
 if margin is None:
     done(1, f"FAILED: could not calculate margin: {mt5.last_error()}")
 if margin > account.margin_free * 0.95:
-    done(3, f"SKIPPED: {symbol} needs {margin:.2f} margin for {lots} lots but only "
-            f"{account.margin_free:.2f} {account.currency} is free")
+    done(3, f"SKIPPED: {symbol} needs {margin:.4f} margin for {lots} lots but only "
+            f"{account.margin_free:.4f} {account.currency} is free")
 
 flags = info.filling_mode
 if flags & 1:
