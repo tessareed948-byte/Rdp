@@ -65,19 +65,19 @@ jobs:
             Write-Error "Missing MT5_LOGIN, MT5_PASSWORD, or MT5_SERVER secrets."
             exit 1
           }
-          $ini = @"
-[Common]
-Login=$($env:MT5_LOGIN)
-Password=$($env:MT5_PASSWORD)
-Server=$($env:MT5_SERVER)
-KeepPrivate=1
-NewsEnable=0
-[Experts]
-Enabled=1
-AllowLiveTrading=1
-AllowDllImport=0
-"@
-          Set-Content -Path "C:\mt5_login.ini" -Value $ini -Encoding ASCII
+          $iniLines = @(
+            "[Common]",
+            "Login=$($env:MT5_LOGIN)",
+            "Password=$($env:MT5_PASSWORD)",
+            "Server=$($env:MT5_SERVER)",
+            "KeepPrivate=1",
+            "NewsEnable=0",
+            "[Experts]",
+            "Enabled=1",
+            "AllowLiveTrading=1",
+            "AllowDllImport=0"
+          )
+          Set-Content -Path "C:\mt5_login.ini" -Value ($iniLines -join "`r`n") -Encoding ASCII
           Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList "/portable", "/config:C:\mt5_login.ini"
           $synced = $false
           for ($i = 0; $i -lt 36; $i++) {
