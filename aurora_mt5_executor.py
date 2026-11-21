@@ -520,6 +520,10 @@ def main():
                         f"MT5 order_check rejected: retcode={check.retcode} ({check.comment})"
                     )
                 print(f"[AuroraMT5] OrderCheckResult: {check}")
+            open_pos_dry, deals_dry = collect_positions_and_deals()
+            result_payload["accountSnapshot"]["openPositionsCount"] = len(open_pos_dry)
+            result_payload["openPositions"] = open_pos_dry
+            result_payload["recentDeals"] = deals_dry
         else:
             send_res = mt5.order_send(request)
             if send_res is None:
