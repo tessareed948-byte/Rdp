@@ -72,6 +72,19 @@ def load_trade_payload():
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             payload = {}
+        # Unwrap compact GitHub repository_dispatch payload_json envelope (<= 10 top-level properties)
+        inner_json = payload.get("payload_json")
+        if isinstance(inner_json, str) and inner_json.strip():
+            try:
+                inner = json.loads(inner_json)
+                if isinstance(inner, dict):
+                    merged = dict(inner)
+                    for k, v in payload.items():
+                        if k != "payload_json" and k not in merged:
+                            merged[k] = v
+                    payload = merged
+            except Exception as inner_exc:
+                print(f"[AuroraMT5] Invalid nested payload_json: {inner_exc}", file=sys.stderr)
     except Exception as exc:
         print(f"[AuroraMT5] Invalid JSON payload: {exc}", file=sys.stderr)
         payload = {}
@@ -432,22 +445,36 @@ def main():
         is_buy = trade["direction"] == "BUY"
         market_price = float(tick.ask if is_buy else tick.bid)
 
-        # 6. Determine Market vs Pending Limit Order
+        # 6. Determine Market vs Pending Limit / Stop Order
         wants_limit = "LIMIT" in trade["order_type"] and trade["entry_price"] > 0
-        use_pending = False
+        wants_stop = "STOP" in trade["order_type"] and trade["entry_price"] > 0
+        pending_kind = None
         exec_price = round(market_price, digits)
 
         if wants_limit:
             cand = round(trade["entry_price"], digits)
             if is_buy and cand <= tick.ask - stops_dist:
-                use_pending = True
+                pending_kind = "LIMIT"
                 exec_price = cand
             elif (not is_buy) and cand >= tick.bid + stops_dist:
-                use_pending = True
+                pending_kind = "LIMIT"
                 exec_price = cand
             else:
                 print(
                     f"[AuroraMT5] Limit price {cand} too close/crossed live quote "
+                    f"(bid={tick.bid}, ask={tick.ask}); routing as Market order."
+                )
+        elif wants_stop:
+            cand = round(trade["entry_price"], digits)
+            if is_buy and cand >= tick.ask + stops_dist:
+                pending_kind = "STOP"
+                exec_price = cand
+            elif (not is_buy) and cand <= tick.bid - stops_dist:
+                pending_kind = "STOP"
+                exec_price = cand
+            else:
+                print(
+                    f"[AuroraMT5] Stop price {cand} already crossed live quote "
                     f"(bid={tick.bid}, ask={tick.ask}); routing as Market order."
                 )
 
@@ -489,10 +516,14 @@ def main():
         result_payload["takeProfit"] = tp
 
         # 9. Construct MT5 Order Request
-        if use_pending:
+        if pending_kind == "LIMIT":
             mt5_action = mt5.TRADE_ACTION_PENDING
             mt5_type = mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
             result_payload["orderType"] = "BUY_LIMIT" if is_buy else "SELL_LIMIT"
+        elif pending_kind == "STOP":
+            mt5_action = mt5.TRADE_ACTION_PENDING
+            mt5_type = mt5.ORDER_TYPE_BUY_STOP if is_buy else mt5.ORDER_TYPE_SELL_STOP
+            result_payload["orderType"] = "BUY_STOP" if is_buy else "SELL_STOP"
         else:
             mt5_action = mt5.TRADE_ACTION_DEAL
             mt5_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
