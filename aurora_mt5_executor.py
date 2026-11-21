@@ -369,6 +369,27 @@ def main():
         result_payload["openPositions"] = open_positions
         result_payload["recentDeals"] = recent_deals
 
+        # 3b. Read-only live MT5 Account & Open Positions Telemetry Sync (works 24/7 including weekends)
+        if trade["event_action"] in ("ACCOUNT_SYNC", "SYNC_TELEMETRY"):
+            open_pos, deals = collect_positions_and_deals()
+            snap["openPositionsCount"] = len(open_pos)
+            result_payload["accountSnapshot"] = snap
+            result_payload["openPositions"] = open_pos
+            result_payload["recentDeals"] = deals
+            result_payload["dryRun"] = True
+            result_payload["brokerRetcode"] = 0
+            result_payload["status"] = "DRY_RUN_VERIFIED"
+            result_payload["brokerMessage"] = (
+                f"MT5 Live Telemetry Synced | Balance=${snap['balance']:.2f} {snap['currency']} | "
+                f"Equity=${snap['equity']:.2f} | FreeMargin=${snap['freeMargin']:.2f} | "
+                f"Open Positions={len(open_pos)} | FloatingPnL=${snap['profit']:.2f}"
+            )
+            print(f"[AuroraMT5] {result_payload['brokerMessage']}")
+            print(f"[AuroraMT5] Open Positions ({len(open_pos)}): {json.dumps(open_pos)}")
+            print(f"AURORA_EXECUTION_RESULT_JSON={json.dumps(result_payload)}")
+            post_callback(trade["callback_url"], result_payload)
+            return
+
         # 4. Idempotency Duplicate Prevention
         dup, dup_reason = is_duplicate_tag(comment_tag)
         if dup and not trade["dry_run"]:
