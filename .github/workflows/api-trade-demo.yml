@@ -1,0 +1,184 @@
+name: API Trade Demo
+
+# Takes the setups from your scanner API and trades them on the Deriv DEMO account.
+#
+# Three ways to start it:
+#   1. Scheduled poll: every 30 minutes on weekdays it asks your API for new setups.
+#      It stays switched off until you create the repo variable API_POLL with the value "on".
+#   2. Pushed by your API: your scanner calls GitHub with the setups (see docs/scanner-api.md).
+#   3. By hand: Run workflow, optionally pasting setups as JSON to test the trade side.
+# While this file lives on the api-trade branch, a push runs one fixed test setup (a 0.01 lot gold buy).
+#
+# The cheap Linux job collects the setups. The Windows job (MT5 terminal) only starts when there is
+# at least one setup to trade, so quiet periods cost almost nothing.
+# Trading is demo only. The script refuses any account that is not a demo account.
+on:
+  push:
+    branches: [api-trade]
+  schedule:
+    - cron: "*/30 6-20 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      setups_json:
+        description: "Optional setups to trade now, as JSON (a list, or an object with a setups list)"
+        required: false
+        default: ""
+  repository_dispatch:
+    types: [scanner-setups]
+
+concurrency:
+  group: api-trade-demo
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    if: github.event_name != 'schedule' || vars.API_POLL == 'on'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      count: ${{ steps.collect.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect setups
+        id: collect
+        env:
+          SCANNER_API_URL: ${{ secrets.SCANNER_API_URL || vars.SCANNER_API_URL }}
+          SCANNER_API_KEY: ${{ secrets.SCANNER_API_KEY }}
+          PAYLOAD_SETUPS: ${{ github.event.client_payload.setups && toJSON(github.event.client_payload.setups) || inputs.setups_json || (github.event_name == 'push' && '[{"id":"pushtest","symbol":"XAUUSD","side":"buy","sl_dist":15,"tp_dist":30,"lots":0.01,"strategy":"pushtest"}]') }}
+          MAX_AGE_MIN: ${{ vars.API_MAX_AGE_MIN || '30' }}
+        run: python3 fetch_setups.py
+
+      - name: Keep the setups for the trade job
+        if: steps.collect.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: setups
+          path: setups.json
+          retention-days: 3
+
+  trade:
+    needs: fetch
+    if: needs.fetch.result == 'success' && needs.fetch.outputs.count != '0'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: setups
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the MetaTrader5 package
+        shell: pwsh
+        run: python -m pip install MetaTrader5==5.0.6231
+
+      - name: Install the Deriv terminal
+        shell: pwsh
+        env:
+          DERIV_INSTALLER_URL: ${{ vars.DERIV_INSTALLER_URL || 'https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe' }}
+        run: |
+          $installer = Join-Path $env:TEMP "deriv5setup.exe"
+          Invoke-WebRequest $env:DERIV_INSTALLER_URL -OutFile $installer -ErrorAction Stop
+          New-Item -ItemType Directory -Path "C:\MT5" -Force | Out-Null
+          Start-Process -FilePath $installer -ArgumentList '/auto /path:"C:\MT5"' -Wait
+          if (-not (Test-Path "C:\MT5\terminal64.exe")) { throw "terminal64.exe not found in C:\MT5" }
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
+
+      - name: Connect to the Deriv demo account and trade the setups
+        shell: pwsh
+        env:
+          # Only this step sees the full list of secrets, so it can find the Deriv ones whatever they are called.
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+          ALL_VARS: ${{ toJSON(vars) }}
+          MT5_TERMINAL_PATH: 'C:\MT5\terminal64.exe'
+          RISK_PCT: ${{ vars.RISK_PCT || '1' }}
+          MAX_RISK_PCT: ${{ vars.MAX_RISK_PCT || '2' }}
+          MAX_LOTS: ${{ vars.XAU_MAX_LOTS || '1' }}
+          MAX_OPEN: ${{ vars.MAX_OPEN || '10' }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          # Find the Deriv demo credentials among the secrets and variables, by name.
+          $all = @{}
+          foreach ($json in @($env:ALL_SECRETS, $env:ALL_VARS)) {
+            if ($json) {
+              $obj = $json | ConvertFrom-Json
+              foreach ($p in $obj.PSObject.Properties) { $all[$p.Name] = [string]$p.Value }
+            }
+          }
+          Write-Host ("Names visible to this workflow: " + (($all.Keys | Sort-Object) -join ", "))
+
+          function Pick([string[]]$patterns) {
+            foreach ($pat in $patterns) {
+              $name = $all.Keys | Where-Object { $_ -match $pat } | Sort-Object | Select-Object -First 1
+              if ($name -and "$($all[$name])".Trim()) {
+                Write-Host "  using $name"
+                return "$($all[$name])".Trim()
+              }
+            }
+            return ""
+          }
+          $login = Pick @('^DERIV.*(LOGIN|ACCOUNT|USER|_ID)$', '^DEMO.*(LOGIN|ACCOUNT|_ID)$', '^MT5_DEMO.*(LOGIN|ACCOUNT|_ID)$')
+          $password = Pick @('^DERIV.*(PASS|PWD)', '^DEMO.*(PASS|PWD)', '^MT5_DEMO.*(PASS|PWD)')
+          $server = Pick @('^DERIV.*SERVER', '^DEMO.*SERVER', '^MT5_DEMO.*SERVER')
+          if (-not $server) { $server = "Deriv-Demo" }
+          if (-not $login -or -not $password) {
+            throw "Could not find the Deriv demo login and password among the names listed above. Save them as the repo secrets DERIV_LOGIN and DERIV_PASSWORD."
+          }
+          Write-Host "::add-mask::$login"
+          Write-Host "::add-mask::$password"
+
+          # The trade script does not need the other secrets.
+          Remove-Item Env:ALL_SECRETS, Env:ALL_VARS -ErrorAction SilentlyContinue
+          $env:MT5_LOGIN = $login
+
+          function Get-SyncCount {
+            $f = Get-ChildItem -Path "C:\MT5\logs" -Filter "2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $f) { return 0 }
+            return @(Get-Content -LiteralPath $f.FullName | Select-String -Pattern "terminal synchronized with").Count
+          }
+
+          $ini = "C:\mt5_login.ini"
+          @(
+            "[Common]"
+            "Login=$login"
+            "Password=$password"
+            "Server=$server"
+            "[Experts]"
+            "Enabled=1"
+            "AllowLiveTrading=1"
+          ) | Set-Content -LiteralPath $ini -Encoding ASCII
+
+          $before = Get-SyncCount
+          $proc = Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList @("/portable", "/config:$ini") -PassThru
+          Write-Host "Terminal started. PID=$($proc.Id)"
+          $synced = $false
+          for ($i = 1; $i -le 36; $i++) {
+            Start-Sleep -Seconds 5
+            if ((Get-SyncCount) -gt $before) {
+              Write-Host "Terminal synchronized after $($i * 5) seconds"
+              $synced = $true
+              break
+            }
+          }
+          if (-not $synced) {
+            Write-Host "RESULT: the terminal never connected to the broker"
+            Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Start-Sleep -Seconds 10
+
+          python api_trade.py setups.json
+          $code = $LASTEXITCODE
+
+          Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
+          exit $code
