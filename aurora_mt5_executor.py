@@ -27,8 +27,8 @@ from datetime import datetime, timedelta, timezone
 import MetaTrader5 as mt5
 
 MAGIC_NUMBER = 20261118
-MAX_RISK_PCT_DEFAULT = 3.0
-MAX_LOTS_DEFAULT = 0.50
+MAX_RISK_PCT_DEFAULT = 50.0
+MAX_LOTS_DEFAULT = 10.0
 
 
 def iso_utc(ts=None):
@@ -119,9 +119,10 @@ def load_trade_payload():
         "tp3_runner": to_float(payload.get("tp3_runner"), 0.0),
         "risk_reward": to_float(payload.get("risk_reward"), 0.0),
         "sizing_mode": sizing_mode,
-        "risk_percent": max(0.1, min(MAX_RISK_PCT_DEFAULT, to_float(payload.get("risk_percent"), 1.0))),
+        "risk_tier": str(payload.get("risk_tier") or "PRIMARY").strip().upper(),
+        "risk_percent": max(0.01, min(MAX_RISK_PCT_DEFAULT, to_float(payload.get("risk_percent"), 10.0))),
         "lot_size": max(0.01, to_float(payload.get("lot_size"), 0.01)),
-        "max_lots": max(0.01, min(10.0, to_float(payload.get("max_lots"), MAX_LOTS_DEFAULT))),
+        "max_lots": max(0.01, min(50.0, to_float(payload.get("max_lots"), MAX_LOTS_DEFAULT))),
         "strategy": str(payload.get("strategy") or "Aurora RR+ Strategy").strip()[:80],
         "callback_url": str(payload.get("callback_url") or os.environ.get("AURORA_CALLBACK_URL") or "").strip(),
     }
