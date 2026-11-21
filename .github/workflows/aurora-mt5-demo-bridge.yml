@@ -1,0 +1,122 @@
+name: Aurora Trade MT5 Demo Auto-Bridge
+
+on:
+  repository_dispatch:
+    types: [bot_trade_signal]
+  workflow_dispatch:
+    inputs:
+      trade_payload_json:
+        description: 'JSON RR+ trade payload from Aurora Trade'
+        required: false
+        type: string
+        default: '{"symbol":"XAUUSD","direction":"BUY","order_type":"MARKET_BUY","lot_size":0.01,"risk_percent":1.0,"strategy":"Aurora Demo Dry-Run Verification","dry_run":true}'
+      dry_run:
+        description: 'Safe dry-run via mt5.order_check (true by default — no order placed)'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: aurora-mt5-bridge-${{ github.event.client_payload.idempotency_key || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  execute-deriv-mt5-demo:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install MetaTrader5 Python package (proven v5.0.6231)
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install MetaTrader5==5.0.6231
+
+      - name: Download & install Deriv MT5 terminal (/portable)
+        shell: pwsh
+        run: |
+          $installer = "C:\deriv5setup.exe"
+          Invoke-WebRequest -Uri "https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe" -OutFile $installer -UseBasicParsing
+          Start-Process -FilePath $installer -ArgumentList '/auto', '/path:"C:\MT5"' -Wait
+          if (-not (Test-Path "C:\MT5\terminal64.exe")) {
+            Write-Error "Deriv MT5 terminal64.exe not found after install"
+            exit 1
+          }
+          Stop-Process -Name terminal64 -Force -ErrorAction SilentlyContinue
+
+      - name: Launch Deriv MT5 Demo terminal & wait for broker sync
+        shell: pwsh
+        env:
+          MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
+          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+        run: |
+          if (-not $env:MT5_LOGIN -or -not $env:MT5_PASSWORD -or -not $env:MT5_SERVER) {
+            Write-Error "Missing MT5_LOGIN, MT5_PASSWORD, or MT5_SERVER secrets."
+            exit 1
+          }
+          $ini = @"
+[Common]
+Login=$($env:MT5_LOGIN)
+Password=$($env:MT5_PASSWORD)
+Server=$($env:MT5_SERVER)
+KeepPrivate=1
+NewsEnable=0
+[Experts]
+Enabled=1
+AllowLiveTrading=1
+AllowDllImport=0
+"@
+          Set-Content -Path "C:\mt5_login.ini" -Value $ini -Encoding ASCII
+          Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList "/portable", "/config:C:\mt5_login.ini"
+          $synced = $false
+          for ($i = 0; $i -lt 36; $i++) {
+            Start-Sleep -Seconds 5
+            $log = Get-ChildItem "C:\MT5\logs\2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($log) {
+              $txt = Get-Content $log.FullName -Raw -ErrorAction SilentlyContinue
+              if ($txt -match "terminal synchronized with") {
+                Write-Host "Deriv MT5 synchronized in $(($i + 1) * 5)s."
+                $synced = $true
+                break
+              }
+            }
+          }
+          if (-not $synced) {
+            Write-Host "Proceeding after sync wait; Python mt5.login() will verify."
+          }
+          Start-Sleep -Seconds 8
+
+      - name: Execute Aurora Trade RR+ Bridge Script (Deriv Demo)
+        shell: pwsh
+        env:
+          MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
+          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+          MT5_TERMINAL_PATH: C:\MT5\terminal64.exe
+          BRIDGE_CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
+          AURORA_CALLBACK_URL: ${{ vars.AURORA_CALLBACK_URL }}
+          DISPATCH_PAYLOAD_JSON: ${{ toJson(github.event.client_payload) }}
+          MANUAL_PAYLOAD_JSON: ${{ github.event.inputs.trade_payload_json }}
+          MANUAL_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          python aurora_mt5_executor.py
+
+      - name: Cleanup temporary MT5 login config & terminal
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item "C:\mt5_login.ini" -Force -ErrorAction SilentlyContinue
+          Stop-Process -Name terminal64 -Force -ErrorAction SilentlyContinue
