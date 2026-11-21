@@ -36,8 +36,21 @@ jobs:
           STYLE: ${{ github.event.inputs.style || 'DAY_TRADING' }}
           DISPATCH_TO_GH: ${{ github.event.inputs.dispatch_to_github || 'true' }}
         run: |
+          set -euo pipefail
           if [ -z "$CRON_SECRET" ]; then
             echo "ERROR: VERCEL_CRON_SECRET secret is missing." >&2
             exit 1
           fi
-          curl -fsSL -X POST "${APP_URL}/api/automation/cycle"             -H "Content-Type: application/json"             -H "X-API-Key: ${CRON_SECRET}"             -H "Authorization: Bearer ${CRON_SECRET}"             -d "{"style":"${STYLE}","useGeminiGate":true,"dispatchToGitHub":${DISPATCH_TO_GH}}" | jq .
+          RESPONSE=$(curl -sS -w "\n%{http_code}" -X POST "${APP_URL}/api/automation/cycle" \
+            -A "AuroraTrade-AutoScanner/1.0" \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: ${CRON_SECRET}" \
+            -H "Authorization: Bearer ${CRON_SECRET}" \
+            -d "{\"style\":\"${STYLE}\",\"useGeminiGate\":true,\"dispatchToGitHub\":${DISPATCH_TO_GH}}")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed "$ d")
+          echo "HTTP_STATUS=${HTTP_CODE}"
+          echo "$BODY" | jq . || echo "$BODY"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            exit 1
+          fi
