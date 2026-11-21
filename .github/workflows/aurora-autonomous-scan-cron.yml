@@ -3,7 +3,7 @@ name: Aurora Trade Autonomous RR+ Scanner (15m London/NY)
 on:
   schedule:
     # Runs every 15 minutes Monday-Friday during London & NY Killzones (07:00 - 20:45 UTC)
-    - cron: '*/15 7-20 * * 1-5'
+    - cron: '*/10 * * * *'
   workflow_dispatch:
     inputs:
       style:
