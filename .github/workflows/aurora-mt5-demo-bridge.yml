@@ -1,4 +1,4 @@
-name: Aurora Trade MT5 Demo Auto-Bridge
+name: Aurora Trade MT5 Demo Auto-Bridge (aurora-mt5-demo-bridge.yml)
 
 on:
   repository_dispatch:
@@ -9,12 +9,12 @@ on:
         description: 'JSON RR+ trade payload from Aurora Trade'
         required: false
         type: string
-        default: '{"symbol":"XAUUSD","direction":"BUY","order_type":"MARKET_BUY","lot_size":0.01,"risk_percent":1.0,"strategy":"Aurora Demo Dry-Run Verification","dry_run":true}'
+        default: '{"symbol":"XAUUSD","direction":"BUY","order_type":"MARKET_BUY","lot_size":0.01,"risk_percent":1.0,"strategy":"Manual Deriv Demo Live Trade","dry_run":false}'
       dry_run:
-        description: 'Safe dry-run via mt5.order_check (true by default — no order placed)'
+        description: 'Live Deriv Demo Auto-Trade is ON by default (false). Set true for dry-run check only.'
         required: false
         type: boolean
-        default: true
+        default: false
 
 concurrency:
   group: aurora-mt5-bridge-${{ github.event.client_payload.idempotency_key || github.run_id }}
@@ -42,11 +42,54 @@ jobs:
           python -m pip install --upgrade pip
           pip install MetaTrader5==5.0.6231
 
-      - name: Download & install Deriv MT5 terminal (/portable)
+      - name: Restore cached Deriv MT5 terminal (avoids download.mql5.com timeouts)
+        id: mt5-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\MT5
+          key: deriv-mt5-portable-v2-win2022
+          restore-keys: |
+            deriv-mt5-portable-v2-
+
+      - name: Download & install Deriv MT5 terminal (/portable) with multi-mirror retry
+        if: steps.mt5-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          if (Test-Path "C:\MT5\terminal64.exe") {
+            Write-Host "MT5 terminal64.exe already present in C:\MT5"
+            exit 0
+          }
           $installer = "C:\deriv5setup.exe"
-          Invoke-WebRequest -Uri "https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe" -OutFile $installer -UseBasicParsing
+          $mirrors = @(
+            "https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe",
+            "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe",
+            "https://download.terminal.free/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
+          )
+          $downloaded = $false
+          foreach ($url in $mirrors) {
+            Write-Host "Attempting MT5 installer download from $url ..."
+            & curl.exe -fSL --retry 4 --retry-delay 3 --retry-all-errors --connect-timeout 25 --max-time 90 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o $installer $url
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $installer) -and ((Get-Item $installer).Length -gt 200000)) {
+              Write-Host "Downloaded MT5 installer cleanly from $url ($((Get-Item $installer).Length) bytes)."
+              $downloaded = $true
+              break
+            }
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing -TimeoutSec 45
+              if ((Test-Path $installer) -and ((Get-Item $installer).Length -gt 200000)) {
+                Write-Host "Downloaded MT5 installer via Invoke-WebRequest from $url."
+                $downloaded = $true
+                break
+              }
+            } catch {
+              Write-Warning "Mirror failed ($url): $($_.Exception.Message)"
+            }
+          }
+          if (-not $downloaded) {
+            Write-Error "All MT5 installer mirrors failed to respond. Retry shortly or verify GitHub runner outbound network."
+            exit 1
+          }
           Start-Process -FilePath $installer -ArgumentList '/auto', '/path:"C:\MT5"' -Wait
           if (-not (Test-Path "C:\MT5\terminal64.exe")) {
             Write-Error "Deriv MT5 terminal64.exe not found after install"
@@ -92,12 +135,11 @@ jobs:
               }
             }
           }
-          if (-not $synced) {
-            Write-Host "Proceeding after sync wait; Python mt5.login() will verify."
-          }
+          if (-not $synced) { Write-Host "Proceeding after sync wait; Python mt5.login() will verify." }
           Start-Sleep -Seconds 8
 
-      - name: Execute Aurora Trade RR+ Bridge Script (Deriv Demo)
+      - name: Execute Aurora Trade RR+ Order & Send Authenticated Callback
+        id: mt5-exec
         shell: pwsh
         env:
           MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
@@ -105,7 +147,7 @@ jobs:
           MT5_SERVER: ${{ secrets.MT5_SERVER }}
           MT5_TERMINAL_PATH: C:\MT5\terminal64.exe
           BRIDGE_CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
-          AURORA_CALLBACK_URL: ${{ vars.AURORA_CALLBACK_URL }}
+          AURORA_CALLBACK_URL: https://trade.eunknowntech.com/api/broker/github/callback
           DISPATCH_PAYLOAD_JSON: ${{ toJson(github.event.client_payload) }}
           MANUAL_PAYLOAD_JSON: ${{ github.event.inputs.trade_payload_json }}
           MANUAL_DRY_RUN: ${{ github.event.inputs.dry_run }}
@@ -113,6 +155,32 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           python aurora_mt5_executor.py
+
+      - name: Report workflow setup/execution failure back to Aurora Trade immediately
+        if: failure()
+        shell: pwsh
+        env:
+          BRIDGE_CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
+          AURORA_CALLBACK_URL: https://trade.eunknowntech.com/api/broker/github/callback
+          IDEMPOTENCY_KEY: ${{ github.event.client_payload.idempotency_key || format('ghrun_{0}', github.run_id) }}
+          SYMBOL_NAME: ${{ github.event.client_payload.symbol || 'ACCOUNT_SYNC' }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          if (-not $env:BRIDGE_CALLBACK_TOKEN) { exit 0 }
+          $runUrl = "$($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)/actions/runs/$($env:GITHUB_RUN_ID)"
+          $payload = @{
+            idempotency_key = $env:IDEMPOTENCY_KEY
+            status = "BROKER_REJECTED"
+            symbol = $env:SYMBOL_NAME
+            broker_message = "GitHub Actions runner failed before MT5 callback (Run #$($env:GITHUB_RUN_ID)). Inspect logs: $runUrl"
+          } | ConvertTo-Json -Compress
+          try {
+            Invoke-RestMethod -Method Post -Uri $env:AURORA_CALLBACK_URL -Headers @{ "X-Bridge-Callback-Token" = $env:BRIDGE_CALLBACK_TOKEN } -ContentType "application/json" -Body $payload -TimeoutSec 20
+          } catch {
+            Write-Warning "Failure callback dispatch error: $($_.Exception.Message)"
+          }
 
       - name: Cleanup temporary MT5 login config & terminal
         if: always()
