@@ -17,14 +17,99 @@ on:
         default: false
 
 concurrency:
-  group: aurora-mt5-bridge-${{ github.event.client_payload.idempotency_key || github.run_id }}
-  cancel-in-progress: false
+  group: aurora-mt5-bridge-${{ (github.event.client_payload.event_action || 'OPEN') == 'ACCOUNT_SYNC' && 'account-sync' || (github.event.client_payload.idempotency_key || github.run_id) }}
+  cancel-in-progress: ${{ (github.event.client_payload.event_action || 'OPEN') == 'ACCOUNT_SYNC' }}
 
 permissions:
   contents: read
 
 jobs:
+  watchdog-preflight:
+    name: Pre-Flight Runner Connection Watchdog (Linux 1x Credits)
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    outputs:
+      proceed: ${{ steps.watchdog.outputs.proceed }}
+      skip_reason: ${{ steps.watchdog.outputs.skip_reason }}
+    steps:
+      - name: Validate MT5 secrets, payload geometry, AuroraTrade health & Deriv connectivity
+        id: watchdog
+        shell: python3 {0}
+        env:
+          MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
+          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+          AURORA_CALLBACK_URL: https://trade.eunknowntech.com/api/broker/github/callback
+          DISPATCH_PAYLOAD_JSON: ${{ toJson(github.event.client_payload) }}
+          MANUAL_PAYLOAD_JSON: ${{ github.event.inputs.trade_payload_json }}
+        run: |
+          import json, os, socket, urllib.request
+          from urllib.parse import urlparse
+
+          def emit(ok, reason):
+            val = "true" if ok else "false"
+            clean = str(reason).replace("\n", " ")[:220]
+            print(f"[Watchdog] proceed={val} | {clean}")
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"proceed={val}\n")
+              fh.write(f"skip_reason={clean}\n")
+
+          def tcp_ok(host, port=443):
+            try:
+              with socket.create_connection((host, port), timeout=5):
+                return True
+            except OSError:
+              return False
+
+          if not (os.environ.get("MT5_LOGIN") and os.environ.get("MT5_PASSWORD") and os.environ.get("MT5_SERVER")):
+            emit(False, "Missing MT5_LOGIN, MT5_PASSWORD, or MT5_SERVER secrets")
+            raise SystemExit(0)
+
+          payload = {}
+          raw_d = os.environ.get("DISPATCH_PAYLOAD_JSON", "").strip()
+          raw_m = os.environ.get("MANUAL_PAYLOAD_JSON", "").strip()
+          try:
+            if raw_d and raw_d not in ("null", "{}"):
+              outer = json.loads(raw_d)
+              payload = json.loads(outer["payload_json"]) if isinstance(outer, dict) and outer.get("payload_json") else outer
+            elif raw_m:
+              payload = json.loads(raw_m)
+          except Exception:
+            payload = {}
+
+          action = str(payload.get("event_action") or "OPEN").upper()
+          if action == "OPEN":
+            sym = str(payload.get("symbol") or "").strip()
+            lot = float(payload.get("lot_size") or 0)
+            sl = float(payload.get("stop_loss") or 0)
+            tp = float(payload.get("take_profit") or 0)
+            if not sym or lot <= 0 or sl <= 0 or tp <= 0:
+              emit(False, f"Invalid or unprotected OPEN payload (sym={sym}, lot={lot}, sl={sl}, tp={tp})")
+              raise SystemExit(0)
+
+          cb = os.environ.get("AURORA_CALLBACK_URL", "")
+          if cb and action != "CLOSE":
+            p = urlparse(cb)
+            try:
+              req = urllib.request.Request(f"{p.scheme}://{p.netloc}/api/health", headers={"User-Agent": "AuroraWatchdog/1.0"})
+              with urllib.request.urlopen(req, timeout=8) as r:
+                if r.status >= 500:
+                  emit(False, f"AuroraTrade health HTTP {r.status}")
+                  raise SystemExit(0)
+            except Exception as e:
+              emit(False, f"AuroraTrade health unreachable: {e}")
+              raise SystemExit(0)
+
+          if not (tcp_ok("ws.derivws.com") or tcp_ok("api.deriv.com") or tcp_ok("download.mql5.com")):
+            emit(False, "Deriv broker network unreachable from runner")
+            raise SystemExit(0)
+
+          emit(True, f"Watchdog OK for {action} — launching Windows MT5 executor")
+
   execute-deriv-mt5-demo:
+    name: Execute on Deriv MT5 (Conditional Windows Runner)
+    needs: watchdog-preflight
+    if: needs.watchdog-preflight.outputs.proceed == 'true'
     runs-on: windows-2022
     timeout-minutes: 5
     steps:
@@ -37,10 +122,23 @@ jobs:
           python-version: "3.12"
           cache: 'pip'
 
-      - name: Install MetaTrader5 Python package (proven v5.0.6231)
+      - name: Restore cached Python MT5 virtualenv (skips pip install on hit)
+        id: venv-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\mt5_venv
+          key: mt5-py312-venv-5.0.6231-win2022
+          restore-keys: |
+            mt5-py312-venv-
+
+      - name: Create venv & install MetaTrader5 Python package (only on cache miss)
+        if: steps.venv-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          pip install --quiet MetaTrader5==5.0.6231
+          if (-not (Test-Path "C:\mt5_venv\Scripts\python.exe")) {
+            python -m venv C:\mt5_venv
+          }
+          C:\mt5_venv\Scripts\pip.exe install --quiet --disable-pip-version-check MetaTrader5==5.0.6231
 
       - name: Restore cached Deriv MT5 terminal (avoids download.mql5.com timeouts)
         id: mt5-cache
@@ -97,7 +195,7 @@ jobs:
           }
           Stop-Process -Name terminal64 -Force -ErrorAction SilentlyContinue
 
-      - name: Launch Deriv MT5 Demo terminal & wait for broker sync
+      - name: Launch Deriv MT5 Demo terminal & fast-poll broker sync
         shell: pwsh
         env:
           MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
@@ -123,20 +221,20 @@ jobs:
           Set-Content -Path "C:\mt5_login.ini" -Value ($iniLines -join "`r`n") -Encoding ASCII
           Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList "/portable", "/config:C:\mt5_login.ini"
           $synced = $false
-          for ($i = 0; $i -lt 36; $i++) {
-            Start-Sleep -Seconds 5
+          for ($i = 0; $i -lt 45; $i++) {
+            Start-Sleep -Seconds 2
             $log = Get-ChildItem "C:\MT5\logs\2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
             if ($log) {
               $txt = Get-Content $log.FullName -Raw -ErrorAction SilentlyContinue
               if ($txt -match "terminal synchronized with") {
-                Write-Host "Deriv MT5 synchronized in $(($i + 1) * 5)s."
+                Write-Host "Deriv MT5 synchronized in $(($i + 1) * 2)s."
                 $synced = $true
                 break
               }
             }
           }
           if (-not $synced) { Write-Host "Proceeding after sync wait; Python mt5.login() will verify." }
-          Start-Sleep -Seconds 8
+          Start-Sleep -Seconds 3
 
       - name: Execute Aurora Trade RR+ Order & Send Authenticated Callback
         id: mt5-exec
@@ -154,7 +252,11 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
-          python aurora_mt5_executor.py
+          if (Test-Path "C:\mt5_venv\Scripts\python.exe") {
+            & C:\mt5_venv\Scripts\python.exe aurora_mt5_executor.py
+          } else {
+            python aurora_mt5_executor.py
+          }
 
       - name: Report workflow setup/execution failure back to Aurora Trade immediately
         if: failure()
