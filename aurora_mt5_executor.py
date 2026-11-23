@@ -11,7 +11,7 @@ Features:
 - Supports OPEN (Market & Pending Limit), CLOSE (position + pending order cancel),
   CLOSE_ALL (flattens all open positions & cancels all pending orders on account),
   ACCOUNT_SYNC, and TEST dry-runs
-- Reports fresh balance, equity, open positions & 7-day deal history to https://trade.eunknowntech.com/api/broker/github/callback
+- Reports fresh balance, equity, open positions & 7-day deal history to https://ais-dev-4hkmnvczzmii2aijjkrfo4-139819472671.europe-west1.run.app/api/broker/github/callback
 """
 import hashlib
 import json
@@ -279,7 +279,7 @@ def main() -> int:
     payload = load_payload()
     action = str(payload.get("event_action") or "ACCOUNT_SYNC").upper()
     idempotency_key = str(payload.get("idempotency_key") or f"ghrun_{os.environ.get('GITHUB_RUN_ID', int(time.time()))}")
-    callback_url = str(payload.get("callback_url") or os.environ.get("AURORA_CALLBACK_URL") or "https://trade.eunknowntech.com/api/broker/github/callback")
+    callback_url = str(payload.get("callback_url") or os.environ.get("AURORA_CALLBACK_URL") or "https://ais-dev-4hkmnvczzmii2aijjkrfo4-139819472671.europe-west1.run.app/api/broker/github/callback")
     callback_token = str(os.environ.get("BRIDGE_CALLBACK_TOKEN") or "")
     dry_run = bool(payload.get("dry_run", False)) or str(os.environ.get("MANUAL_DRY_RUN", "")).lower() == "true"
 
