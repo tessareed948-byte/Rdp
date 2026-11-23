@@ -124,7 +124,7 @@ def compute_verified_mt5_lots(symbol: str, direction: str, entry: float, sl: flo
 
 
 def collect_account_telemetry():
-    """Reads live Deriv MT5 account snapshot, open positions, and 7-day closed deals."""
+    """Reads live Deriv MT5 account snapshot, open positions, pending orders, and 7-day closed deals."""
     acc = mt5.account_info()
     positions = mt5.positions_get() or []
     orders = mt5.orders_get() or []
@@ -144,6 +144,30 @@ def collect_account_telemetry():
             "takeProfit": float(p.tp),
             "profitUsd": round(float(p.profit), 2),
             "comment": str(p.comment or ""),
+            "openedAt": datetime.fromtimestamp(int(getattr(p, "time", 0) or time.time()), tz=timezone.utc).isoformat(),
+        })
+
+    pending_orders = []
+    for o in orders:
+        is_buy_ord = o.type in (mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_BUY_STOP, mt5.ORDER_TYPE_BUY_STOP_LIMIT)
+        ord_type_map = {
+            mt5.ORDER_TYPE_BUY_LIMIT: "BUY_LIMIT",
+            mt5.ORDER_TYPE_SELL_LIMIT: "SELL_LIMIT",
+            mt5.ORDER_TYPE_BUY_STOP: "BUY_STOP",
+            mt5.ORDER_TYPE_SELL_STOP: "SELL_STOP",
+        }
+        pending_orders.append({
+            "ticket": str(o.ticket),
+            "symbol": str(o.symbol),
+            "direction": "BUY" if is_buy_ord else "SELL",
+            "orderType": ord_type_map.get(o.type, "BUY_LIMIT" if is_buy_ord else "SELL_LIMIT"),
+            "volume": round(float(getattr(o, "volume_current", getattr(o, "volume_initial", 0.01))), 2),
+            "priceOpen": float(o.price_open),
+            "priceCurrent": float(getattr(o, "price_current", o.price_open)),
+            "stopLoss": float(o.sl),
+            "takeProfit": float(o.tp),
+            "comment": str(o.comment or ""),
+            "placedAt": datetime.fromtimestamp(int(getattr(o, "time_setup", 0) or time.time()), tz=timezone.utc).isoformat(),
         })
 
     recent_deals = []
@@ -172,26 +196,29 @@ def collect_account_telemetry():
         "profit": round(float(acc.profit), 2) if acc else 0.0,
         "leverage": int(acc.leverage) if acc else 0,
         "openPositionsCount": len(open_positions),
-        "pendingOrdersCount": len(orders),
+        "pendingOrdersCount": len(pending_orders),
         "tradeMode": "DEMO" if (acc and acc.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO) else "REAL",
         "syncedAt": now_utc.isoformat(),
     }
-    return snapshot, open_positions, recent_deals
+    return snapshot, open_positions, pending_orders, recent_deals
 
 
 def post_callback(callback_url: str, token: str, body: dict):
-    if not callback_url or not token:
+    clean_url = re.sub(r"[\r\n\0]+", "", str(callback_url or "")).strip()
+    clean_token = re.sub(r"[\r\n\0]+", "", str(token or "")).strip()
+    print(f"[MT5_EXEC] status={body.get('status')} symbol={body.get('symbol')} msg={body.get('broker_message', '')}")
+    if not clean_url or not clean_token:
         print("Callback URL or token missing; skipping callback.")
         return
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
-        callback_url,
+        clean_url,
         data=data,
         method="POST",
         headers={
             "Content-Type": "application/json",
-            "X-Bridge-Callback-Token": token,
-            "User-Agent": "AuroraMT5Executor/2.0",
+            "X-Bridge-Callback-Token": clean_token,
+            "User-Agent": "AuroraMT5Executor/2.1",
         },
     )
     try:
@@ -260,6 +287,126 @@ def cancel_pending_order_obj(order, cancel_comment: str):
     return mt5.order_send(req)
 
 
+def cleanup_stale_and_duplicate_pending_orders() -> list:
+    """
+    Automatic MT5-native hygiene sweep:
+    1. Cancels ANY pending order on a symbol that ALREADY has an open position (fixes stacked USDCAD BUY + BUY LIMIT).
+    2. Cancels duplicate pending orders on the same symbol (keeps only the most recent one).
+    3. Cancels stale unfilled pending orders once price has already reached >=65% of entry->TP distance, breached SL, or aged >90m (fixes zombie GBPJPY SELL LIMIT after TP smashed).
+    """
+    actions = []
+    open_syms = {norm_symbol(p.symbol) for p in (mt5.positions_get() or [])}
+    pending = list(mt5.orders_get() or [])
+    if not pending:
+        return actions
+
+    # Group pending orders by canonical symbol, newest first
+    by_sym = {}
+    for o in sorted(pending, key=lambda x: int(getattr(x, "time_setup", 0) or 0), reverse=True):
+        by_sym.setdefault(norm_symbol(o.symbol), []).append(o)
+
+    now_ts = int(time.time())
+    for sym_key, ord_list in by_sym.items():
+        for idx, ord_obj in enumerate(ord_list):
+            reason = None
+            if sym_key in open_syms:
+                reason = f"duplicate_with_open_pos({ord_obj.symbol})"
+            elif idx > 0:
+                reason = f"duplicate_pending_order({ord_obj.symbol})"
+            else:
+                tick = mt5.symbol_info_tick(ord_obj.symbol)
+                entry_p = float(ord_obj.price_open or 0.0)
+                sl_p = float(ord_obj.sl or 0.0)
+                tp_p = float(ord_obj.tp or 0.0)
+                is_buy_ord = ord_obj.type in (mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_BUY_STOP, mt5.ORDER_TYPE_BUY_STOP_LIMIT)
+                age_sec = max(0, now_ts - int(getattr(ord_obj, "time_setup", 0) or now_ts))
+                if tick and entry_p > 0:
+                    spot = float(tick.ask if is_buy_ord else tick.bid)
+                    if tp_p > 0:
+                        reward_dist = abs(tp_p - entry_p)
+                        favorable = (spot - entry_p) if is_buy_ord else (entry_p - spot)
+                        if reward_dist > 0 and favorable >= reward_dist * 0.65:
+                            reason = f"tp_move_missed({int((favorable / reward_dist) * 100)}%_to_TP)"
+                    if not reason and sl_p > 0:
+                        if (is_buy_ord and spot <= sl_p) or ((not is_buy_ord) and spot >= sl_p):
+                            reason = "sl_breached_before_fill"
+                if not reason and age_sec > 90 * 60:
+                    reason = f"expired_unfilled({int(age_sec // 60)}m)"
+
+            if reason:
+                res = cancel_pending_order_obj(ord_obj, "bot-clean")
+                rc = int(getattr(res, "retcode", -1)) if res else -1
+                msg = f"Cancelled stale/dup pending #{ord_obj.ticket} {ord_obj.symbol} ({reason}, rc={rc})"
+                print(f"[MT5_CLEANUP] {msg}")
+                actions.append(msg)
+    return actions
+
+
+def auto_protect_open_positions_on_mt5() -> list:
+    """
+    MT5-native humanized profit-protection safety net (runs during sync & executions):
+    Ensures profitable trades (e.g. USDCAD BUY +3.5R / 72% to TP) never sit with original losing SL.
+    - At >= +1.0R (or >= 50% to TP): moves SL to Entry + 0.08R cushion (Break-Even+).
+    - At >= +2.2R (or >= 68% to TP): locks SL at Entry + 1.0R (or 55% of current gain).
+    Strictly monotonic: never widens SL backwards.
+    """
+    protected = []
+    for pos in (mt5.positions_get() or []):
+        sym_info = mt5.symbol_info(pos.symbol)
+        tick = mt5.symbol_info_tick(pos.symbol)
+        if not sym_info or not tick:
+            continue
+        is_buy = pos.type == mt5.POSITION_TYPE_BUY
+        entry_p = float(pos.price_open or 0.0)
+        cur_sl = float(pos.sl or 0.0)
+        cur_tp = float(pos.tp or 0.0)
+        if entry_p <= 0 or cur_tp <= 0:
+            continue
+        spot = float(tick.bid if is_buy else tick.ask)
+        digits = int(sym_info.digits or 5)
+        stops_buf = max(int(getattr(sym_info, "trade_stops_level", 0) or 0), 5) * float(sym_info.point or 0.0001)
+        favorable = (spot - entry_p) if is_buy else (entry_p - spot)
+        reward_dist = abs(cur_tp - entry_p)
+        if favorable <= 0 or reward_dist <= 0:
+            continue
+        progress_pct = (favorable / reward_dist) * 100.0
+        # Estimate initial risk distance from SL if SL is still on loss side, else reward/2.5
+        sl_is_in_loss = (cur_sl <= 0) or (is_buy and cur_sl < entry_p) or ((not is_buy) and cur_sl > entry_p)
+        risk_dist = abs(entry_p - cur_sl) if (cur_sl > 0 and sl_is_in_loss) else (reward_dist / 2.5)
+        if risk_dist <= 0:
+            continue
+        cur_r = favorable / risk_dist
+
+        desired_sl = None
+        stage_lbl = None
+        if cur_r >= 2.2 or progress_pct >= 68.0:
+            lock_dist = max(risk_dist * 1.0, favorable * 0.45)
+            desired_sl = entry_p + lock_dist if is_buy else entry_p - lock_dist
+            stage_lbl = "LOCK_+1R"
+        elif sl_is_in_loss and (cur_r >= 1.0 or progress_pct >= 50.0):
+            desired_sl = entry_p + risk_dist * 0.08 if is_buy else entry_p - risk_dist * 0.08
+            stage_lbl = "BE_PLUS_0.08R"
+
+        if desired_sl is not None:
+            # Ensure valid stops distance from current market spot
+            if is_buy and desired_sl >= spot - stops_buf:
+                desired_sl = spot - stops_buf * 1.5
+            elif (not is_buy) and desired_sl <= spot + stops_buf:
+                desired_sl = spot + stops_buf * 1.5
+            desired_sl = round(desired_sl, digits)
+            improves = (is_buy and (cur_sl <= 0 or desired_sl > cur_sl + sym_info.point * 2) and desired_sl < spot) or (
+                (not is_buy) and (cur_sl <= 0 or desired_sl < cur_sl - sym_info.point * 2) and desired_sl > spot
+            )
+            if improves:
+                res = modify_position_sltp_obj(pos, new_sl=desired_sl)
+                rc = int(getattr(res, "retcode", -1)) if res else -1
+                if rc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
+                    msg = f"Auto-protected #{pos.ticket} {pos.symbol} [{stage_lbl}] SL {cur_sl} -> {desired_sl} (prog={progress_pct:.0f}%, +{cur_r:.2f}R)"
+                    print(f"[MT5_PROTECT] {msg}")
+                    protected.append(msg)
+    return protected
+
+
 def load_payload() -> dict:
     raw_d = os.environ.get("DISPATCH_PAYLOAD_JSON", "").strip()
     raw_m = os.environ.get("MANUAL_PAYLOAD_JSON", "").strip()
@@ -279,8 +426,8 @@ def main() -> int:
     payload = load_payload()
     action = str(payload.get("event_action") or "ACCOUNT_SYNC").upper()
     idempotency_key = str(payload.get("idempotency_key") or f"ghrun_{os.environ.get('GITHUB_RUN_ID', int(time.time()))}")
-    callback_url = str(payload.get("callback_url") or os.environ.get("AURORA_CALLBACK_URL") or "https://trade.eunknowntech.com/api/broker/github/callback")
-    callback_token = str(os.environ.get("BRIDGE_CALLBACK_TOKEN") or "")
+    callback_url = re.sub(r"[\r\n\0]+", "", str(payload.get("callback_url") or os.environ.get("AURORA_CALLBACK_URL") or "https://trade.eunknowntech.com/api/broker/github/callback")).strip()
+    callback_token = re.sub(r"[\r\n\0]+", "", str(os.environ.get("BRIDGE_CALLBACK_TOKEN") or "")).strip()
     dry_run = bool(payload.get("dry_run", False)) or str(os.environ.get("MANUAL_DRY_RUN", "")).lower() == "true"
 
     login = int(os.environ.get("MT5_LOGIN", "0") or 0)
@@ -312,18 +459,33 @@ def main() -> int:
         if acc.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO:
             raise RuntimeError("SAFETY BLOCK: Only Deriv DEMO accounts are permitted.")
 
-        # 1. ACCOUNT_SYNC or TEST (Read-only telemetry)
+        # Run live MT5 hygiene & profit-protection sweeps on every non-TEST/non-CLOSE_ALL cycle
+        cleanup_notes = []
+        protect_notes = []
+        if action not in ("CLOSE_ALL", "TEST") and not (action != "ACCOUNT_SYNC" and dry_run):
+            cleanup_notes = cleanup_stale_and_duplicate_pending_orders()
+            protect_notes = auto_protect_open_positions_on_mt5()
+            if cleanup_notes or protect_notes:
+                time.sleep(0.8)
+
+        # 1. ACCOUNT_SYNC or TEST (Read-only telemetry + live stale-order hygiene & BE protection on ACCOUNT_SYNC)
         if action in ("ACCOUNT_SYNC", "TEST") or dry_run:
-            snap, open_pos, deals = collect_account_telemetry()
+            snap, open_pos, pending_ord, deals = collect_account_telemetry()
+            extra = ""
+            if cleanup_notes:
+                extra += f" Cleaned {len(cleanup_notes)} stale/dup pending."
+            if protect_notes:
+                extra += f" Protected {len(protect_notes)} open position(s)."
             post_callback(callback_url, callback_token, {
                 "idempotency_key": idempotency_key,
                 "status": "ACCOUNT_SYNCED" if action == "ACCOUNT_SYNC" else "DRY_RUN_VERIFIED",
                 "dry_run": True if action != "ACCOUNT_SYNC" else False,
                 "symbol": str(payload.get("symbol") or "ACCOUNT_SYNC"),
                 "account_mode": "DEMO",
-                "broker_message": f"Deriv MT5 Demo synced: balance=${snap['balance']}, equity=${snap['equity']}, open={snap['openPositionsCount']}, pending={snap['pendingOrdersCount']}.",
+                "broker_message": f"Deriv MT5 Demo synced: balance=${snap['balance']}, equity=${snap['equity']}, open={snap['openPositionsCount']}, pending={snap['pendingOrdersCount']}.{extra}",
                 "account_snapshot": snap,
                 "open_positions": open_pos,
+                "pending_orders": pending_ord,
                 "recent_deals": deals,
             })
             return 0
@@ -347,7 +509,7 @@ def main() -> int:
                 else:
                     errors.append(f"ord#{ord_obj.ticket}:{getattr(res, 'retcode', 'ERR')}")
             time.sleep(1.5)
-            snap, open_pos, deals = collect_account_telemetry()
+            snap, open_pos, pending_ord, deals = collect_account_telemetry()
             msg = f"CLOSE_ALL completed [{close_comment}]: closed {closed_count} position(s), cancelled {cancelled_count} pending order(s)."
             if errors:
                 msg += f" Warnings: {', '.join(errors[:4])}"
@@ -360,6 +522,7 @@ def main() -> int:
                 "broker_message": msg,
                 "account_snapshot": snap,
                 "open_positions": open_pos,
+                "pending_orders": pending_ord,
                 "recent_deals": deals,
             })
             return 0
@@ -382,7 +545,7 @@ def main() -> int:
                     if res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
                         cancelled_orders.append(str(ord_obj.ticket))
             time.sleep(1.0)
-            snap, open_pos, deals = collect_account_telemetry()
+            snap, open_pos, pending_ord, deals = collect_account_telemetry()
             post_callback(callback_url, callback_token, {
                 "idempotency_key": idempotency_key,
                 "status": "BROKER_CONFIRMED",
@@ -393,6 +556,7 @@ def main() -> int:
                 "broker_message": f"Invalidated CLOSE [{close_comment}]: closed {len(closed_tickets)} pos, cancelled {len(cancelled_orders)} pending.",
                 "account_snapshot": snap,
                 "open_positions": open_pos,
+                "pending_orders": pending_ord,
                 "recent_deals": deals,
             })
             return 0
@@ -411,7 +575,7 @@ def main() -> int:
                     if res and res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED, mt5.TRADE_RETCODE_NO_CHANGES):
                         modified_tickets.append(str(pos.ticket))
             time.sleep(0.8)
-            snap, open_pos, deals = collect_account_telemetry()
+            snap, open_pos, pending_ord, deals = collect_account_telemetry()
             post_callback(callback_url, callback_token, {
                 "idempotency_key": idempotency_key,
                 "status": "BROKER_CONFIRMED",
@@ -422,6 +586,7 @@ def main() -> int:
                 "broker_message": f"Humanized {stage}: modified SL/TP on {len(modified_tickets)} position(s) (SL={new_sl}).",
                 "account_snapshot": snap,
                 "open_positions": open_pos,
+                "pending_orders": pending_ord,
                 "recent_deals": deals,
             })
             return 0
@@ -442,7 +607,6 @@ def main() -> int:
                     cur_vol = float(pos.volume)
                     raw_part = cur_vol * (pct / 100.0)
                     part_vol = round(math.floor(raw_part / step) * step, 2)
-                    # Only partial-close if at least vol_min remains open; otherwise still move SL to protect profit
                     if part_vol >= vol_min and (cur_vol - part_vol) >= vol_min:
                         res_p = close_position_obj(pos, close_comment, volume_override=part_vol)
                         if res_p and res_p.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
@@ -454,7 +618,7 @@ def main() -> int:
                             if str(rpos.ticket) == str(pos.ticket) or norm_symbol(rpos.symbol) == req_sym:
                                 modify_position_sltp_obj(rpos, new_sl=new_sl)
             time.sleep(1.0)
-            snap, open_pos, deals = collect_account_telemetry()
+            snap, open_pos, pending_ord, deals = collect_account_telemetry()
             post_callback(callback_url, callback_token, {
                 "idempotency_key": idempotency_key,
                 "status": "BROKER_CONFIRMED",
@@ -465,11 +629,12 @@ def main() -> int:
                 "broker_message": f"Humanized Partial Profit [{close_comment}] ({pct:.0f}%): banked {len(banked_tickets)} partial(s), SL locked @ {new_sl}.",
                 "account_snapshot": snap,
                 "open_positions": open_pos,
+                "pending_orders": pending_ord,
                 "recent_deals": deals,
             })
             return 0
 
-        # 4. OPEN — Strict Live Anti-Hedging Guard + Verified Tick-Value Lot Sizing + bot-XXXXXX Comment
+        # 4. OPEN — Strict Live Anti-Hedging Guard + Smart Limit/Market Fill + Stops-Level Validation + Verified Balance Lot Sizing
         requested_sym = str(payload.get("symbol") or "").upper()
         base_sym = norm_symbol(requested_sym)
         broker_sym = resolve_broker_symbol(requested_sym)
@@ -486,7 +651,7 @@ def main() -> int:
         # HARD LIVE ANTI-HEDGING GUARD: refuse ANY new order if pair already has an open position OR pending order (either direction!)
         for existing_pos in (mt5.positions_get() or []):
             if norm_symbol(existing_pos.symbol) == base_sym:
-                snap, open_pos, deals = collect_account_telemetry()
+                snap, open_pos, pending_ord, deals = collect_account_telemetry()
                 post_callback(callback_url, callback_token, {
                     "idempotency_key": idempotency_key,
                     "status": "SKIPPED_DUPLICATE",
@@ -497,13 +662,14 @@ def main() -> int:
                     "broker_message": f"ANTI-HEDGING BLOCK: {broker_sym} already has open position #{existing_pos.ticket} ({'BUY' if existing_pos.type == mt5.POSITION_TYPE_BUY else 'SELL'}). Cannot trade same pair twice or both ways.",
                     "account_snapshot": snap,
                     "open_positions": open_pos,
+                    "pending_orders": pending_ord,
                     "recent_deals": deals,
                 })
                 return 0
 
         for existing_ord in (mt5.orders_get() or []):
             if norm_symbol(existing_ord.symbol) == base_sym:
-                snap, open_pos, deals = collect_account_telemetry()
+                snap, open_pos, pending_ord, deals = collect_account_telemetry()
                 post_callback(callback_url, callback_token, {
                     "idempotency_key": idempotency_key,
                     "status": "SKIPPED_DUPLICATE",
@@ -514,6 +680,7 @@ def main() -> int:
                     "broker_message": f"ANTI-HEDGING BLOCK: {broker_sym} already has pending order #{existing_ord.ticket}. Cannot stack or hedge same pair.",
                     "account_snapshot": snap,
                     "open_positions": open_pos,
+                    "pending_orders": pending_ord,
                     "recent_deals": deals,
                 })
                 return 0
@@ -524,12 +691,77 @@ def main() -> int:
             raise RuntimeError(f"Symbol {broker_sym} not tradable or missing tick data on Deriv MT5.")
 
         digits = int(sym_info.digits or 5)
+        point = float(sym_info.point or (10 ** (-digits)))
+        spread = abs(float(tick.ask) - float(tick.bid))
+        stops_level = max(int(getattr(sym_info, "trade_stops_level", 0) or 0), int(getattr(sym_info, "trade_freeze_level", 0) or 0), 3) * point
+        min_clearance = max(stops_level * 1.25, spread * 1.5, point * 5)
+
         is_buy = direction == "BUY"
         spot_price = float(tick.ask if is_buy else tick.bid)
         is_limit = "LIMIT" in order_type_str or "STOP" in order_type_str
         exec_price = round(entry_req if (is_limit and entry_req > 0) else spot_price, digits)
         sl_price = round(sl_req, digits)
         tp_price = round(tp_req, digits)
+
+        # Smart live geometry check before submitting to MT5 (prevents retcode 10015/10016 & stale missed-TP limits)
+        if is_limit and entry_req > 0 and sl_price > 0 and tp_price > 0:
+            reward_dist = abs(tp_price - entry_req)
+            risk_dist = abs(entry_req - sl_price)
+            favorable_from_entry = (spot_price - entry_req) if is_buy else (entry_req - spot_price)
+            # 1) If market already ran >= 65% of the way to TP while runner booted, NEVER place a stale limit order
+            if reward_dist > 0 and favorable_from_entry >= reward_dist * 0.65:
+                snap, open_pos, pending_ord, deals = collect_account_telemetry()
+                post_callback(callback_url, callback_token, {
+                    "idempotency_key": idempotency_key,
+                    "status": "SKIPPED_DUPLICATE",
+                    "dry_run": False,
+                    "symbol": requested_sym,
+                    "broker_symbol": broker_sym,
+                    "account_mode": "DEMO",
+                    "broker_message": f"STALE_LIMIT_SKIPPED: {broker_sym} spot ({spot_price}) already moved {int((favorable_from_entry/reward_dist)*100)}% toward TP ({tp_price}) past entry ({entry_req}). Avoiding zombie limit.",
+                    "account_snapshot": snap,
+                    "open_positions": open_pos,
+                    "pending_orders": pending_ord,
+                    "recent_deals": deals,
+                })
+                return 0
+            # 2) If market already breached SL before execution, skip cleanly
+            if (is_buy and spot_price <= sl_price + min_clearance) or ((not is_buy) and spot_price >= sl_price - min_clearance):
+                snap, open_pos, pending_ord, deals = collect_account_telemetry()
+                post_callback(callback_url, callback_token, {
+                    "idempotency_key": idempotency_key,
+                    "status": "SKIPPED_DUPLICATE",
+                    "dry_run": False,
+                    "symbol": requested_sym,
+                    "broker_symbol": broker_sym,
+                    "account_mode": "DEMO",
+                    "broker_message": f"SL_BREACHED_PRE_FILL: {broker_sym} spot ({spot_price}) already reached SL ({sl_price}) before fill. Skipping invalidated setup.",
+                    "account_snapshot": snap,
+                    "open_positions": open_pos,
+                    "pending_orders": pending_ord,
+                    "recent_deals": deals,
+                })
+                return 0
+            # 3) If price is already at/better than limit entry OR within broker stops_level / 15% risk tolerance, fill MARKET immediately so we don't miss sniper entries or hit retcode 10015
+            at_or_better_limit = (is_buy and spot_price <= exec_price) or ((not is_buy) and spot_price >= exec_price)
+            too_close_for_pending = abs(spot_price - exec_price) <= max(min_clearance * 1.2, risk_dist * 0.15)
+            if at_or_better_limit or too_close_for_pending:
+                print(f"[MT5_EXEC] Converting {order_type_str} ({exec_price}) to MARKET at live spot {spot_price} (better/near fill)")
+                is_limit = False
+                order_type_str = "MARKET_BUY" if is_buy else "MARKET_SELL"
+                exec_price = round(spot_price, digits)
+
+        # Validate SL/TP strict side & broker stops_level clearance relative to final exec_price
+        if is_buy:
+            if sl_price >= exec_price - min_clearance:
+                sl_price = round(exec_price - max(abs(entry_req - sl_req), min_clearance * 2), digits)
+            if tp_price <= exec_price + min_clearance:
+                tp_price = round(exec_price + max(abs(tp_req - entry_req), min_clearance * 4), digits)
+        else:
+            if sl_price <= exec_price + min_clearance:
+                sl_price = round(exec_price + max(abs(sl_req - entry_req), min_clearance * 2), digits)
+            if tp_price >= exec_price - min_clearance:
+                tp_price = round(exec_price - max(abs(entry_req - tp_req), min_clearance * 4), digits)
 
         sizing_mode = str(payload.get("sizing_mode") or "RISK_PERCENT").upper()
         live_bal_used = float(acc.balance or 0.0)
@@ -569,7 +801,7 @@ def main() -> int:
 
         result = mt5.order_send(request)
         time.sleep(1.0)
-        snap, open_pos, deals = collect_account_telemetry()
+        snap, open_pos, pending_ord, deals = collect_account_telemetry()
 
         if result and result.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
             post_callback(callback_url, callback_token, {
@@ -589,6 +821,7 @@ def main() -> int:
                 "broker_message": f"Executed [{bot_comment}] {direction} {verified_lots} {broker_sym} @ {result.price or exec_price} (Bal=${live_bal_used}, Risk={risk_pct}%/${risk_usd_used}, retcode={result.retcode})",
                 "account_snapshot": snap,
                 "open_positions": open_pos,
+                "pending_orders": pending_ord,
                 "recent_deals": deals,
             })
             return 0
@@ -606,11 +839,12 @@ def main() -> int:
             "broker_message": f"Order rejected [{bot_comment}] (retcode={err_code}): {err_comment}",
             "account_snapshot": snap,
             "open_positions": open_pos,
+            "pending_orders": pending_ord,
             "recent_deals": deals,
         })
         return 1
     except Exception as exc:
-        snap, open_pos, deals = collect_account_telemetry()
+        snap, open_pos, pending_ord, deals = collect_account_telemetry()
         post_callback(callback_url, callback_token, {
             "idempotency_key": idempotency_key,
             "status": "BROKER_REJECTED",
@@ -618,6 +852,7 @@ def main() -> int:
             "broker_message": f"MT5 executor error: {exc}",
             "account_snapshot": snap,
             "open_positions": open_pos,
+            "pending_orders": pending_ord,
             "recent_deals": deals,
         })
         return 1
