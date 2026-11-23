@@ -17,7 +17,7 @@ on:
         default: false
 
 concurrency:
-  group: aurora-mt5-bridge-${{ (github.event.client_payload.event_action || 'OPEN') == 'ACCOUNT_SYNC' && 'account-sync' || (github.event.client_payload.idempotency_key || github.run_id) }}
+  group: aurora-mt5-bridge-${{ (github.event.client_payload.event_action || 'OPEN') == 'ACCOUNT_SYNC' && 'account-sync' || format('sym-{0}', github.event.client_payload.symbol || 'ALL') }}
   cancel-in-progress: ${{ (github.event.client_payload.event_action || 'OPEN') == 'ACCOUNT_SYNC' }}
 
 permissions:
@@ -270,7 +270,8 @@ jobs:
           GITHUB_SERVER_URL: ${{ github.server_url }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          if (-not $env:BRIDGE_CALLBACK_TOKEN) { exit 0 }
+          $cbToken = ($env:BRIDGE_CALLBACK_TOKEN -replace '[\r\n\0]', '').Trim()
+          if (-not $cbToken) { exit 0 }
           $runUrl = "$($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)/actions/runs/$($env:GITHUB_RUN_ID)"
           $payload = @{
             idempotency_key = $env:IDEMPOTENCY_KEY
@@ -279,7 +280,7 @@ jobs:
             broker_message = "GitHub Actions runner failed before MT5 callback (Run #$($env:GITHUB_RUN_ID)). Inspect logs: $runUrl"
           } | ConvertTo-Json -Compress
           try {
-            Invoke-RestMethod -Method Post -Uri $env:AURORA_CALLBACK_URL -Headers @{ "X-Bridge-Callback-Token" = $env:BRIDGE_CALLBACK_TOKEN } -ContentType "application/json" -Body $payload -TimeoutSec 20
+            Invoke-RestMethod -Method Post -Uri $env:AURORA_CALLBACK_URL -Headers @{ "X-Bridge-Callback-Token" = $cbToken } -ContentType "application/json" -Body $payload -TimeoutSec 20
           } catch {
             Write-Warning "Failure callback dispatch error: $($_.Exception.Message)"
           }
