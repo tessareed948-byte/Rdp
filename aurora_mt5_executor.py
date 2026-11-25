@@ -117,14 +117,51 @@ def compute_verified_mt5_lots(symbol: str, direction: str, entry: float, sl: flo
     step = float(sym.volume_step or 0.01)
     vol_min = float(sym.volume_min or 0.01)
     vol_max = min(float(sym.volume_max or max_lots), float(max_lots))
+    # Margin safety check: ensure required margin never exceeds 85% of free margin (prevents retcode 10019 NO_MONEY)
+    try:
+        margin_per_lot = mt5.order_calc_margin(order_type, symbol, 1.0, float(entry))
+        free_margin = float(getattr(acc, "margin_free", 0.0) or 0.0)
+        if margin_per_lot is not None and float(margin_per_lot) > 0 and free_margin > 0:
+            max_margin_lots = (free_margin * 0.85) / float(margin_per_lot)
+            if max_margin_lots < raw_lots:
+                print(f"[MT5_LOTS] Capping {symbol} lots from {raw_lots:.2f} -> {max_margin_lots:.2f} to fit 85% free margin (${free_margin:.2f})")
+                raw_lots = max_margin_lots
+    except Exception:
+        pass
     bounded = min(raw_lots, vol_max)
     stepped = math.floor(bounded / step) * step
     verified = round(max(vol_min, min(vol_max, stepped)), 2)
     return verified, round(live_balance, 2), risk_usd
 
 
+def collect_tradable_deriv_symbols() -> list:
+    """Discovers verified tradable symbols with live non-zero quotes on the connected Deriv MT5 account."""
+    known_candidates = [
+        "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD",
+        "GBPJPY", "EURJPY", "EURGBP", "AUDJPY", "EURCHF", "EURCAD", "GBPCAD", "AUDCAD",
+        "XAUUSD", "XAGUSD", "NAS100", "US30", "SPX500", "BTCUSD", "ETHUSD",
+    ]
+    verified = []
+    seen = set()
+    for base in known_candidates:
+        resolved = resolve_broker_symbol(base)
+        info = mt5.symbol_info(resolved)
+        if not info:
+            continue
+        if int(getattr(info, "trade_mode", 0) or 0) == mt5.SYMBOL_TRADE_MODE_DISABLED:
+            continue
+        tick = mt5.symbol_info_tick(resolved)
+        if not tick or float(getattr(tick, "bid", 0.0) or 0.0) <= 0 or float(getattr(tick, "ask", 0.0) or 0.0) <= 0:
+            continue
+        canon = norm_symbol(resolved)
+        if canon and canon not in seen:
+            seen.add(canon)
+            verified.append(canon)
+    return verified
+
+
 def collect_account_telemetry():
-    """Reads live Deriv MT5 account snapshot, open positions, pending orders, and 7-day closed deals."""
+    """Reads live Deriv MT5 account snapshot, open positions, pending orders, tradable symbols, and 7-day closed deals."""
     acc = mt5.account_info()
     positions = mt5.positions_get() or []
     orders = mt5.orders_get() or []
@@ -185,6 +222,12 @@ def collect_account_telemetry():
                 "closedAt": datetime.fromtimestamp(int(d.time), tz=timezone.utc).isoformat(),
             })
 
+    tradable_syms = []
+    try:
+        tradable_syms = collect_tradable_deriv_symbols()
+    except Exception:
+        tradable_syms = []
+
     snapshot = {
         "login": str(acc.login) if acc else "",
         "server": str(acc.server) if acc else os.environ.get("MT5_SERVER", "Deriv-Demo"),
@@ -197,6 +240,7 @@ def collect_account_telemetry():
         "leverage": int(acc.leverage) if acc else 0,
         "openPositionsCount": len(open_positions),
         "pendingOrdersCount": len(pending_orders),
+        "tradableSymbols": tradable_syms,
         "tradeMode": "DEMO" if (acc and acc.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO) else "REAL",
         "syncedAt": now_utc.isoformat(),
     }
@@ -688,7 +732,38 @@ def main() -> int:
         sym_info = mt5.symbol_info(broker_sym)
         tick = mt5.symbol_info_tick(broker_sym)
         if not sym_info or not tick:
-            raise RuntimeError(f"Symbol {broker_sym} not tradable or missing tick data on Deriv MT5.")
+            snap, open_pos, pending_ord, deals = collect_account_telemetry()
+            post_callback(callback_url, callback_token, {
+                "idempotency_key": idempotency_key,
+                "status": "BROKER_REJECTED",
+                "dry_run": False,
+                "symbol": requested_sym,
+                "broker_symbol": broker_sym,
+                "account_mode": "DEMO",
+                "broker_message": f"UNSUPPORTED_SYMBOL: {broker_sym} does not exist on this Deriv MT5 account.",
+                "account_snapshot": snap,
+                "open_positions": open_pos,
+                "pending_orders": pending_ord,
+                "recent_deals": deals,
+            })
+            return 0
+
+        if int(getattr(sym_info, "trade_mode", 0) or 0) == mt5.SYMBOL_TRADE_MODE_DISABLED or float(getattr(tick, "bid", 0.0) or 0.0) <= 0.0 or float(getattr(tick, "ask", 0.0) or 0.0) <= 0.0:
+            snap, open_pos, pending_ord, deals = collect_account_telemetry()
+            post_callback(callback_url, callback_token, {
+                "idempotency_key": idempotency_key,
+                "status": "BROKER_REJECTED",
+                "dry_run": False,
+                "symbol": requested_sym,
+                "broker_symbol": broker_sym,
+                "account_mode": "DEMO",
+                "broker_message": f"SYMBOL_NOT_TRADABLE_ZERO_QUOTE: {broker_sym} has trade_mode={getattr(sym_info, 'trade_mode', 'N/A')} or zero quote (bid={getattr(tick, 'bid', 0)}, ask={getattr(tick, 'ask', 0)}) on this Deriv MT5 account.",
+                "account_snapshot": snap,
+                "open_positions": open_pos,
+                "pending_orders": pending_ord,
+                "recent_deals": deals,
+            })
+            return 0
 
         digits = int(sym_info.digits or 5)
         point = float(sym_info.point or (10 ** (-digits)))
