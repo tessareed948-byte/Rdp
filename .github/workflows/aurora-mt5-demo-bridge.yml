@@ -26,6 +26,7 @@ permissions:
 jobs:
   watchdog-preflight:
     name: Pre-Flight Runner Connection Watchdog (Linux 1x Credits)
+    if: ${{ (github.event.client_payload.event_action || 'OPEN') != 'ACCOUNT_SYNC' && (github.event.client_payload.event_action || 'OPEN') != 'CLOSE_ALL' }}
     runs-on: ubuntu-latest
     timeout-minutes: 1
     outputs:
@@ -107,9 +108,9 @@ jobs:
           emit(True, f"Watchdog OK for {action} — launching Windows MT5 executor")
 
   execute-deriv-mt5-demo:
-    name: Execute on Deriv MT5 (Conditional Windows Runner)
+    name: Execute on Deriv MT5 (Fast Direct Windows Runner)
     needs: watchdog-preflight
-    if: needs.watchdog-preflight.outputs.proceed == 'true'
+    if: ${{ always() && (needs.watchdog-preflight.result == 'skipped' || needs.watchdog-preflight.outputs.proceed == 'true') }}
     runs-on: windows-2022
     timeout-minutes: 5
     steps:
@@ -222,19 +223,19 @@ jobs:
           Start-Process -FilePath "C:\MT5\terminal64.exe" -ArgumentList "/portable", "/config:C:\mt5_login.ini"
           $synced = $false
           for ($i = 0; $i -lt 45; $i++) {
-            Start-Sleep -Seconds 2
+            Start-Sleep -Seconds 1
             $log = Get-ChildItem "C:\MT5\logs\2*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
             if ($log) {
               $txt = Get-Content $log.FullName -Raw -ErrorAction SilentlyContinue
               if ($txt -match "terminal synchronized with") {
-                Write-Host "Deriv MT5 synchronized in $(($i + 1) * 2)s."
+                Write-Host "Deriv MT5 synchronized in $($i + 1)s."
                 $synced = $true
                 break
               }
             }
           }
           if (-not $synced) { Write-Host "Proceeding after sync wait; Python mt5.login() will verify." }
-          Start-Sleep -Seconds 3
+          Start-Sleep -Seconds 2
 
       - name: Execute Aurora Trade RR+ Order & Send Authenticated Callback
         id: mt5-exec
