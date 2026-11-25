@@ -431,6 +431,32 @@ def auto_protect_open_positions_on_mt5() -> list:
             desired_sl = entry_p + risk_dist * 0.08 if is_buy else entry_p - risk_dist * 0.08
             stage_lbl = "BE_PLUS_0.08R"
 
+        # 44thStudio Runner Trail: once SL is already at/past breakeven (or reaching +1R), trail behind M5 EMA50 +/- 0.25*ATR
+        if (not sl_is_in_loss) or (desired_sl is not None):
+            try:
+                rates = mt5.copy_rates_from_pos(pos.symbol, mt5.TIMEFRAME_M5, 1, 80)
+                if rates is not None and len(rates) >= 55:
+                    closes = [float(r["close"]) for r in rates]
+                    k_ema = 2.0 / 51.0
+                    ema50 = closes[0]
+                    for cv in closes[1:]:
+                        ema50 = cv * k_ema + ema50 * (1.0 - k_ema)
+                    trs = []
+                    for ri in range(max(1, len(rates) - 14), len(rates)):
+                        rh = float(rates[ri]["high"])
+                        rl = float(rates[ri]["low"])
+                        rpc = float(rates[ri - 1]["close"])
+                        trs.append(max(rh - rl, abs(rh - rpc), abs(rl - rpc)))
+                    atr5 = sum(trs) / max(1, len(trs))
+                    ema_trail = (ema50 - 0.25 * atr5) if is_buy else (ema50 + 0.25 * atr5)
+                    trail_in_profit = (is_buy and ema_trail > entry_p) or ((not is_buy) and ema_trail < entry_p)
+                    if trail_in_profit:
+                        if desired_sl is None or (is_buy and ema_trail > desired_sl) or ((not is_buy) and ema_trail < desired_sl):
+                            desired_sl = ema_trail
+                            stage_lbl = "EMA50_ATR_TRAIL"
+            except Exception:
+                pass
+
         if desired_sl is not None:
             # Ensure valid stops distance from current market spot
             if is_buy and desired_sl >= spot - stops_buf:
