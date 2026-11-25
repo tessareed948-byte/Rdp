@@ -388,13 +388,20 @@ def cleanup_stale_and_duplicate_pending_orders() -> list:
 
 def auto_protect_open_positions_on_mt5() -> list:
     """
-    MT5-native humanized profit-protection safety net (runs during sync & executions):
-    Ensures profitable trades (e.g. USDCAD BUY +3.5R / 72% to TP) never sit with original losing SL.
-    - At >= +1.0R (or >= 50% to TP): moves SL to Entry + 0.08R cushion (Break-Even+).
-    - At >= +2.2R (or >= 68% to TP): locks SL at Entry + 1.0R (or 55% of current gain).
+    MT5-native 4-stage intraday profit-protection & anti-reversal manager (runs during sync & executions):
+    Solves the 6-hour stagnation/reversal giveback problem WITHOUT reducing profitability:
+    - Stage 1 (>= +0.9R or >= 42% to TP): moves SL to Entry + 0.12R (Break-Even+ covering spread/commission).
+    - Stage 2 (>= +1.4R or >= 60% to TP): automatically partial-closes 50% of lot volume (once) to bank hard cash
+      AND locks remaining SL at Entry + 0.70R!
+    - Stage 3 (>= +1.9R or >= 78% to TP): locks SL at max(+1.25R, 65% of open gain, M5 EMA50 +/- 0.20*ATR).
+    - Stage 4 (Intraday Time-Decay Anti-Reversal):
+        * >= 4.0h open & >= +0.45R profit: ratchets SL tightly to 70% of current open profit.
+        * >= 5.5h open & >= +0.35R profit: banks remaining open profit before session reversal!
+        * >= 6.5h open & flat (-0.35R .. +0.35R): closes stalled dead-chop position cleanly.
     Strictly monotonic: never widens SL backwards.
     """
     protected = []
+    now_epoch = time.time()
     for pos in (mt5.positions_get() or []):
         sym_info = mt5.symbol_info(pos.symbol)
         tick = mt5.symbol_info_tick(pos.symbol)
@@ -411,27 +418,73 @@ def auto_protect_open_positions_on_mt5() -> list:
         stops_buf = max(int(getattr(sym_info, "trade_stops_level", 0) or 0), 5) * float(sym_info.point or 0.0001)
         favorable = (spot - entry_p) if is_buy else (entry_p - spot)
         reward_dist = abs(cur_tp - entry_p)
-        if favorable <= 0 or reward_dist <= 0:
+        if reward_dist <= 0:
             continue
         progress_pct = (favorable / reward_dist) * 100.0
-        # Estimate initial risk distance from SL if SL is still on loss side, else reward/2.5
+        # Estimate initial risk distance from SL if SL is still on loss side, else reward/2.2
         sl_is_in_loss = (cur_sl <= 0) or (is_buy and cur_sl < entry_p) or ((not is_buy) and cur_sl > entry_p)
-        risk_dist = abs(entry_p - cur_sl) if (cur_sl > 0 and sl_is_in_loss) else (reward_dist / 2.5)
+        risk_dist = abs(entry_p - cur_sl) if (cur_sl > 0 and sl_is_in_loss) else (reward_dist / 2.2)
         if risk_dist <= 0:
             continue
         cur_r = favorable / risk_dist
+        locked_r = ((cur_sl - entry_p) / risk_dist) if is_buy else ((entry_p - cur_sl) / risk_dist)
+        pos_open_ts = int(getattr(pos, "time", 0) or 0)
+        age_hours = max(0.0, (now_epoch - pos_open_ts) / 3600.0) if pos_open_ts > 0 else 0.0
+
+        # Stage 4B/4C: Intraday 5.5h+ Time-Decay Bank / Dead-Chop Exit (stops 6-hour trades from reversing!)
+        if age_hours >= 5.5 and cur_r >= 0.35:
+            close_res = close_position_by_obj(pos, f"TIME_DECAY_BANK_{age_hours:.1f}H")
+            rc = int(getattr(close_res, "retcode", -1)) if close_res else -1
+            if rc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
+                msg = f"Time-decay profit bank #{pos.ticket} {pos.symbol} after {age_hours:.1f}h at +{cur_r:.2f}R (prevented reversal)"
+                print(f"[MT5_PROTECT] {msg}")
+                protected.append(msg)
+                continue
+        if age_hours >= 6.5 and -0.35 <= cur_r <= 0.35:
+            close_res = close_position_by_obj(pos, f"TIME_DECAY_FLAT_{age_hours:.1f}H")
+            rc = int(getattr(close_res, "retcode", -1)) if close_res else -1
+            if rc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
+                msg = f"Time-decay dead-chop close #{pos.ticket} {pos.symbol} after {age_hours:.1f}h at {cur_r:+.2f}R"
+                print(f"[MT5_PROTECT] {msg}")
+                protected.append(msg)
+                continue
+
+        if favorable <= 0:
+            continue
+
+        # Stage 2 Partial Bank: at >= +1.4R (or >= 60% to TP), take 50% off the table ONCE (gated by locked_r < 0.55)
+        if (cur_r >= 1.4 or progress_pct >= 60.0) and locked_r < 0.55:
+            vol_min = float(sym_info.volume_min or 0.01)
+            vol_step = float(sym_info.volume_step or 0.01)
+            if float(pos.volume) >= vol_min * 2.0:
+                half_vol = round(math.floor((float(pos.volume) * 0.5) / vol_step) * vol_step, 4)
+                if half_vol >= vol_min and (float(pos.volume) - half_vol) >= vol_min:
+                    part_res = close_position_by_obj(pos, "PARTIAL_50_BANK", volume_override=half_vol)
+                    prc = int(getattr(part_res, "retcode", -1)) if part_res else -1
+                    if prc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
+                        msg = f"Partial-banked 50% ({half_vol} lots) on #{pos.ticket} {pos.symbol} at +{cur_r:.2f}R"
+                        print(f"[MT5_PROTECT] {msg}")
+                        protected.append(msg)
 
         desired_sl = None
         stage_lbl = None
-        if cur_r >= 2.2 or progress_pct >= 68.0:
-            lock_dist = max(risk_dist * 1.0, favorable * 0.45)
+        if cur_r >= 1.9 or progress_pct >= 78.0:
+            lock_dist = max(risk_dist * 1.25, favorable * 0.65)
             desired_sl = entry_p + lock_dist if is_buy else entry_p - lock_dist
-            stage_lbl = "LOCK_+1R"
-        elif sl_is_in_loss and (cur_r >= 1.0 or progress_pct >= 50.0):
-            desired_sl = entry_p + risk_dist * 0.08 if is_buy else entry_p - risk_dist * 0.08
-            stage_lbl = "BE_PLUS_0.08R"
+            stage_lbl = "LOCK_+1.25R"
+        elif cur_r >= 1.4 or progress_pct >= 60.0:
+            lock_dist = max(risk_dist * 0.70, favorable * 0.50)
+            desired_sl = entry_p + lock_dist if is_buy else entry_p - lock_dist
+            stage_lbl = "LOCK_+0.70R"
+        elif age_hours >= 4.0 and cur_r >= 0.45:
+            lock_dist = max(risk_dist * 0.25, favorable * 0.70)
+            desired_sl = entry_p + lock_dist if is_buy else entry_p - lock_dist
+            stage_lbl = "TIME_LOCK_70PCT"
+        elif sl_is_in_loss and (cur_r >= 0.9 or progress_pct >= 42.0):
+            desired_sl = entry_p + risk_dist * 0.12 if is_buy else entry_p - risk_dist * 0.12
+            stage_lbl = "BE_PLUS_0.12R"
 
-        # 44thStudio Runner Trail: once SL is already at/past breakeven (or reaching +1R), trail behind M5 EMA50 +/- 0.25*ATR
+        # 44thStudio Runner Trail: once SL is already at/past breakeven (or reaching +0.9R), trail behind M5 EMA50 +/- 0.20*ATR
         if (not sl_is_in_loss) or (desired_sl is not None):
             try:
                 rates = mt5.copy_rates_from_pos(pos.symbol, mt5.TIMEFRAME_M5, 1, 80)
@@ -448,7 +501,7 @@ def auto_protect_open_positions_on_mt5() -> list:
                         rpc = float(rates[ri - 1]["close"])
                         trs.append(max(rh - rl, abs(rh - rpc), abs(rl - rpc)))
                     atr5 = sum(trs) / max(1, len(trs))
-                    ema_trail = (ema50 - 0.25 * atr5) if is_buy else (ema50 + 0.25 * atr5)
+                    ema_trail = (ema50 - 0.20 * atr5) if is_buy else (ema50 + 0.20 * atr5)
                     trail_in_profit = (is_buy and ema_trail > entry_p) or ((not is_buy) and ema_trail < entry_p)
                     if trail_in_profit:
                         if desired_sl is None or (is_buy and ema_trail > desired_sl) or ((not is_buy) and ema_trail < desired_sl):
@@ -471,7 +524,7 @@ def auto_protect_open_positions_on_mt5() -> list:
                 res = modify_position_sltp_obj(pos, new_sl=desired_sl)
                 rc = int(getattr(res, "retcode", -1)) if res else -1
                 if rc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
-                    msg = f"Auto-protected #{pos.ticket} {pos.symbol} [{stage_lbl}] SL {cur_sl} -> {desired_sl} (prog={progress_pct:.0f}%, +{cur_r:.2f}R)"
+                    msg = f"Auto-protected #{pos.ticket} {pos.symbol} [{stage_lbl}] SL {cur_sl} -> {desired_sl} (age={age_hours:.1f}h, prog={progress_pct:.0f}%, +{cur_r:.2f}R)"
                     print(f"[MT5_PROTECT] {msg}")
                     protected.append(msg)
     return protected
