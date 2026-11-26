@@ -415,18 +415,33 @@ def cleanup_stale_and_duplicate_pending_orders() -> list:
     return actions
 
 
-def auto_protect_open_positions_on_mt5() -> list:
+def resolve_position_strategy_rules(pos, payload: dict) -> dict:
     """
-    MT5-native 4-stage intraday profit-protection & anti-reversal manager (runs during sync & executions):
-    Solves the 6-hour stagnation/reversal giveback problem WITHOUT reducing profitability:
-    - Stage 1 (>= +0.9R or >= 42% to TP): moves SL to Entry + 0.12R (Break-Even+ covering spread/commission).
-    - Stage 2 (>= +1.4R or >= 60% to TP): automatically partial-closes 50% of lot volume (once) to bank hard cash
-      AND locks remaining SL at Entry + 0.70R!
-    - Stage 3 (>= +1.9R or >= 78% to TP): locks SL at max(+1.25R, 65% of open gain, M5 EMA50 +/- 0.20*ATR).
-    - Stage 4 (Intraday Time-Decay Anti-Reversal):
-        * >= 4.0h open & >= +0.45R profit: ratchets SL tightly to 70% of current open profit.
-        * >= 5.5h open & >= +0.35R profit: banks remaining open profit before session reversal!
-        * >= 6.5h open & flat (-0.35R .. +0.35R): closes stalled dead-chop position cleanly.
+    Dynamically resolves per-position SL/TP management parameters sent from the server's
+    database strategy configuration ('active_position_strategy_rules' keyed by ticket or symbol,
+    falling back to 'strategy_management' in the active dispatch payload).
+    """
+    rules_map = payload.get("active_position_strategy_rules")
+    if isinstance(rules_map, dict):
+        by_ticket = rules_map.get(str(pos.ticket))
+        if isinstance(by_ticket, dict):
+            return by_ticket
+        by_sym = rules_map.get(norm_symbol(pos.symbol))
+        if isinstance(by_sym, dict):
+            return by_sym
+    direct = payload.get("strategy_management")
+    if isinstance(direct, dict):
+        return direct
+    return {}
+
+
+def auto_protect_open_positions_on_mt5(payload: dict) -> list:
+    """
+    MT5-native strategy-driven profit-protection & anti-reversal manager:
+    Dynamically reads each position's database strategy SL/TP management rules from the bridge payload
+    (breakevenTriggerR, partialCloseTriggerR, partialClosePercent, lockProfitTriggerR, lockProfitFloorR,
+    trailingMode, trailingAtrMultiplier, maxHoldHours, deadChopCloseHours, targetRiskReward)
+    so every open position strictly obeys its own strategy configuration.
     Strictly monotonic: never widens SL backwards.
     """
     protected = []
@@ -449,31 +464,45 @@ def auto_protect_open_positions_on_mt5() -> list:
         reward_dist = abs(cur_tp - entry_p)
         if reward_dist <= 0:
             continue
+
+        # Dynamically read this position's strategy config rules fetched from Supabase DB
+        strat_rules = resolve_position_strategy_rules(pos, payload)
+        strat_target_rr = max(1.0, float(strat_rules.get("target_rr") or payload.get("strategy_target_rr") or payload.get("risk_reward") or 2.0))
+        be_trigger_r = max(0.4, float(strat_rules.get("breakevenTriggerR") or min(strat_target_rr * 0.5, 1.0)))
+        be_lock_r = max(0.05, float(strat_rules.get("breakevenLockR") or 0.12))
+        partial_trigger_r = max(0.4, float(strat_rules.get("partialCloseTriggerR") or be_trigger_r))
+        partial_pct = max(0.0, min(80.0, float(strat_rules.get("partialClosePercent") if strat_rules.get("partialClosePercent") is not None else 50.0)))
+        lock_trigger_r = max(be_trigger_r + 0.25, float(strat_rules.get("lockProfitTriggerR") or min(strat_target_rr * 0.78, strat_target_rr - 0.25)))
+        lock_floor_r = max(0.20, float(strat_rules.get("lockProfitFloorR") or lock_trigger_r * 0.55))
+        trailing_mode = str(strat_rules.get("trailingMode") or "EMA50_ATR_TRAIL").upper()
+        trailing_atr_mult = max(0.10, float(strat_rules.get("trailingAtrMultiplier") or 0.20))
+        max_hold_hours = max(1.0, float(strat_rules.get("maxHoldHours") or 5.5))
+        dead_chop_hours = max(max_hold_hours + 0.5, float(strat_rules.get("deadChopCloseHours") or (max_hold_hours + 1.0)))
+
         progress_pct = (favorable / reward_dist) * 100.0
-        # Estimate initial risk distance from SL if SL is still on loss side, else reward/2.2
+        # Estimate initial risk distance from SL if SL is still on loss side, else reward / strategy target R:R
         sl_is_in_loss = (cur_sl <= 0) or (is_buy and cur_sl < entry_p) or ((not is_buy) and cur_sl > entry_p)
-        risk_dist = abs(entry_p - cur_sl) if (cur_sl > 0 and sl_is_in_loss) else (reward_dist / 2.2)
+        risk_dist = abs(entry_p - cur_sl) if (cur_sl > 0 and sl_is_in_loss) else (reward_dist / strat_target_rr)
         if risk_dist <= 0:
             continue
         cur_r = favorable / risk_dist
-        locked_r = ((cur_sl - entry_p) / risk_dist) if is_buy else ((entry_p - cur_sl) / risk_dist)
         pos_open_ts = int(getattr(pos, "time", 0) or 0)
         age_hours = max(0.0, (now_epoch - pos_open_ts) / 3600.0) if pos_open_ts > 0 else 0.0
 
-        # Stage 4B/4C: Intraday 5.5h+ Time-Decay Bank / Dead-Chop Exit (stops 6-hour trades from reversing!)
-        if age_hours >= 5.5 and cur_r >= 0.35:
+        # Strategy-style Time-Decay Anti-Reversal (respects scalper vs day_trader vs swing_trader DB trading_style)
+        if age_hours >= max_hold_hours and cur_r >= 0.35:
             close_res = close_position_obj(pos, f"TIME_DECAY_BANK_{age_hours:.1f}H")
             rc = int(getattr(close_res, "retcode", -1)) if close_res else -1
             if rc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
-                msg = f"Time-decay profit bank #{pos.ticket} {pos.symbol} after {age_hours:.1f}h at +{cur_r:.2f}R (prevented reversal)"
+                msg = f"Time-decay profit bank #{pos.ticket} {pos.symbol} after {age_hours:.1f}h (max={max_hold_hours:.1f}h) at +{cur_r:.2f}R"
                 print(f"[MT5_PROTECT] {msg}")
                 protected.append(msg)
                 continue
-        if age_hours >= 6.5 and -0.35 <= cur_r <= 0.35:
+        if age_hours >= dead_chop_hours and -0.35 <= cur_r <= 0.35:
             close_res = close_position_obj(pos, f"TIME_DECAY_FLAT_{age_hours:.1f}H")
             rc = int(getattr(close_res, "retcode", -1)) if close_res else -1
             if rc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
-                msg = f"Time-decay dead-chop close #{pos.ticket} {pos.symbol} after {age_hours:.1f}h at {cur_r:+.2f}R"
+                msg = f"Time-decay dead-chop close #{pos.ticket} {pos.symbol} after {age_hours:.1f}h (limit={dead_chop_hours:.1f}h) at {cur_r:+.2f}R"
                 print(f"[MT5_PROTECT] {msg}")
                 protected.append(msg)
                 continue
@@ -481,37 +510,36 @@ def auto_protect_open_positions_on_mt5() -> list:
         if favorable <= 0:
             continue
 
-        # Stage 1 Partial Bank & Breakeven+ (Empirically Verified 78.3% WR / PF 2.21 Profit-Capture Rule):
-        # At >= +0.60R (or >= 46% to TP), bank 60% cash ONCE (gated by sl_is_in_loss) AND lock SL to Entry + 0.12R!
-        if sl_is_in_loss and (cur_r >= 0.60 or progress_pct >= 46.0):
+        # Strategy-driven Partial Bank & Breakeven+ (uses DB partialCloseTriggerR & partialClosePercent)
+        if sl_is_in_loss and partial_pct > 0 and (cur_r >= partial_trigger_r or progress_pct >= 50.0):
             vol_min = float(sym_info.volume_min or 0.01)
             vol_step = float(sym_info.volume_step or 0.01)
             if float(pos.volume) >= vol_min * 2.0:
-                part_vol = round(math.floor((float(pos.volume) * 0.60) / vol_step) * vol_step, 4)
+                part_vol = round(math.floor((float(pos.volume) * (partial_pct / 100.0)) / vol_step) * vol_step, 4)
                 if part_vol >= vol_min and (float(pos.volume) - part_vol) >= vol_min:
                     part_res = close_position_obj(pos, "PARTIAL_60_BANK", volume_override=part_vol)
                     prc = int(getattr(part_res, "retcode", -1)) if part_res else -1
                     if prc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
-                        msg = f"Partial-banked 60% ({part_vol} lots) on #{pos.ticket} {pos.symbol} at +{cur_r:.2f}R"
+                        msg = f"Partial-banked {partial_pct:.0f}% ({part_vol} lots) on #{pos.ticket} {pos.symbol} at +{cur_r:.2f}R (strategy trigger={partial_trigger_r:.2f}R)"
                         print(f"[MT5_PROTECT] {msg}")
                         protected.append(msg)
 
         desired_sl = None
         stage_lbl = None
-        if cur_r >= 1.00 or progress_pct >= 75.0:
-            lock_dist = max(risk_dist * 0.55, favorable * 0.60)
+        if cur_r >= lock_trigger_r or progress_pct >= 75.0:
+            lock_dist = max(risk_dist * lock_floor_r, favorable * 0.60)
             desired_sl = entry_p + lock_dist if is_buy else entry_p - lock_dist
-            stage_lbl = "LOCK_+0.55R"
-        elif age_hours >= 4.0 and cur_r >= 0.30:
+            stage_lbl = f"LOCK_+{lock_floor_r:.2f}R"
+        elif age_hours >= max(2.0, max_hold_hours * 0.72) and cur_r >= 0.30:
             lock_dist = max(risk_dist * 0.18, favorable * 0.70)
             desired_sl = entry_p + lock_dist if is_buy else entry_p - lock_dist
             stage_lbl = "TIME_LOCK_70PCT"
-        elif sl_is_in_loss and (cur_r >= 0.60 or progress_pct >= 46.0):
-            desired_sl = entry_p + risk_dist * 0.12 if is_buy else entry_p - risk_dist * 0.12
-            stage_lbl = "BE_PLUS_0.12R"
+        elif sl_is_in_loss and (cur_r >= be_trigger_r or progress_pct >= 46.0):
+            desired_sl = entry_p + risk_dist * be_lock_r if is_buy else entry_p - risk_dist * be_lock_r
+            stage_lbl = f"BE_PLUS_{be_lock_r:.2f}R"
 
-        # 44thStudio Runner Trail: once SL is already at/past breakeven (or reaching +0.9R), trail behind M5 EMA50 +/- 0.20*ATR
-        if (not sl_is_in_loss) or (desired_sl is not None):
+        # Strategy-driven Runner Trail: obeys trailingMode (ATR_TRAIL vs EMA50_ATR_TRAIL vs STRUCTURAL_LOCK)
+        if ((not sl_is_in_loss) or (desired_sl is not None)) and trailing_mode in ("EMA50_ATR_TRAIL", "ATR_TRAIL"):
             try:
                 rates = mt5.copy_rates_from_pos(pos.symbol, mt5.TIMEFRAME_M5, 1, 80)
                 if rates is not None and len(rates) >= 55:
@@ -527,12 +555,15 @@ def auto_protect_open_positions_on_mt5() -> list:
                         rpc = float(rates[ri - 1]["close"])
                         trs.append(max(rh - rl, abs(rh - rpc), abs(rl - rpc)))
                     atr5 = sum(trs) / max(1, len(trs))
-                    ema_trail = (ema50 - 0.20 * atr5) if is_buy else (ema50 + 0.20 * atr5)
-                    trail_in_profit = (is_buy and ema_trail > entry_p) or ((not is_buy) and ema_trail < entry_p)
+                    if trailing_mode == "ATR_TRAIL":
+                        trail_lvl = (spot - trailing_atr_mult * atr5) if is_buy else (spot + trailing_atr_mult * atr5)
+                    else:
+                        trail_lvl = (ema50 - trailing_atr_mult * atr5) if is_buy else (ema50 + trailing_atr_mult * atr5)
+                    trail_in_profit = (is_buy and trail_lvl > entry_p) or ((not is_buy) and trail_lvl < entry_p)
                     if trail_in_profit:
-                        if desired_sl is None or (is_buy and ema_trail > desired_sl) or ((not is_buy) and ema_trail < desired_sl):
-                            desired_sl = ema_trail
-                            stage_lbl = "EMA50_ATR_TRAIL"
+                        if desired_sl is None or (is_buy and trail_lvl > desired_sl) or ((not is_buy) and trail_lvl < desired_sl):
+                            desired_sl = trail_lvl
+                            stage_lbl = trailing_mode
             except Exception:
                 pass
 
@@ -613,7 +644,7 @@ def main() -> int:
         protect_notes = []
         if action not in ("CLOSE_ALL", "TEST") and not (action != "ACCOUNT_SYNC" and dry_run):
             cleanup_notes = cleanup_stale_and_duplicate_pending_orders()
-            protect_notes = auto_protect_open_positions_on_mt5()
+            protect_notes = auto_protect_open_positions_on_mt5(payload)
             if cleanup_notes or protect_notes:
                 time.sleep(0.8)
 
@@ -817,40 +848,8 @@ def main() -> int:
             })
             return 0
 
-        # HARD MINIMUM STRUCTURAL SL PIP FLOOR (eliminates 5.5-pip EURGBP noise stop-outs & 15-lot explosions!)
-        if entry_req > 0 and sl_req > 0:
-            sl_dist_req = abs(entry_req - sl_req)
-            if base_sym.startswith(("BTC", "ETH", "SOL")):
-                min_sl_req = entry_req * 0.004
-                min_sl_label = "0.40%"
-            elif "XAU" in base_sym:
-                min_sl_req = 4.50
-                min_sl_label = "45 pips ($4.50)"
-            elif "XAG" in base_sym:
-                min_sl_req = 0.20
-                min_sl_label = "20 pips ($0.20)"
-            elif base_sym.endswith("JPY"):
-                min_sl_req = 0.22
-                min_sl_label = "22 pips"
-            else:
-                min_sl_req = 0.0015
-                min_sl_label = "15 pips"
-            if sl_dist_req < min_sl_req * 0.92:
-                snap, open_pos, pending_ord, deals = collect_account_telemetry()
-                post_callback(callback_url, callback_token, {
-                    "idempotency_key": idempotency_key,
-                    "status": "BROKER_REJECTED",
-                    "dry_run": False,
-                    "symbol": requested_sym,
-                    "broker_symbol": broker_sym,
-                    "account_mode": "DEMO",
-                    "broker_message": f"SL_FLOOR_BLOCK: {base_sym} SL distance {sl_dist_req:.5f} is tighter than structural minimum {min_sl_label} — blocking noise stop-out & lot explosion.",
-                    "account_snapshot": snap,
-                    "open_positions": open_pos,
-                    "pending_orders": pending_ord,
-                    "recent_deals": deals,
-                })
-                return 0
+        # STRATEGY-NATIVE SL/TP PRESERVATION: Never hardcode pip floors; obey each strategy's exact SL and TP.
+        # Live broker spread & MT5 stops_level hygiene below prevents untradeable spread traps without altering strategy rules.
 
         # HARD LIVE ANTI-HEDGING GUARD: refuse ANY new order if pair already has an open position OR pending order (either direction!)
         for existing_pos in (mt5.positions_get() or []):
@@ -1006,17 +1005,45 @@ def main() -> int:
                 order_type_str = "MARKET_BUY" if is_buy else "MARKET_SELL"
                 exec_price = round(spot_price, digits)
 
-        # Validate SL/TP strict side & broker stops_level clearance relative to final exec_price
+        # Validate SL/TP strict side & broker stops_level clearance relative to final exec_price,
+        # honoring strategy database target R:R and minimum R:R compliance (zero hardcoded multipliers!)
+        strategy_min_rr = float(payload.get("strategy_min_rr") or 0.0)
+        strategy_target_rr = float(payload.get("strategy_target_rr") or payload.get("risk_reward") or strategy_min_rr or 1.2)
+        req_sl_span = abs(entry_req - sl_req) if (entry_req > 0 and sl_req > 0) else 0.0
+        req_tp_span = abs(tp_req - entry_req) if (entry_req > 0 and tp_req > 0) else 0.0
         if is_buy:
             if sl_price >= exec_price - min_clearance:
-                sl_price = round(exec_price - max(abs(entry_req - sl_req), min_clearance * 2), digits)
+                sl_price = round(exec_price - max(req_sl_span, min_clearance * 1.5), digits)
             if tp_price <= exec_price + min_clearance:
-                tp_price = round(exec_price + max(abs(tp_req - entry_req), min_clearance * 4), digits)
+                tp_span = max(req_tp_span, abs(exec_price - sl_price) * strategy_target_rr, min_clearance * 1.5)
+                tp_price = round(exec_price + tp_span, digits)
         else:
             if sl_price <= exec_price + min_clearance:
-                sl_price = round(exec_price + max(abs(sl_req - entry_req), min_clearance * 2), digits)
+                sl_price = round(exec_price + max(req_sl_span, min_clearance * 1.5), digits)
             if tp_price >= exec_price - min_clearance:
-                tp_price = round(exec_price - max(abs(entry_req - tp_req), min_clearance * 4), digits)
+                tp_span = max(req_tp_span, abs(sl_price - exec_price) * strategy_target_rr, min_clearance * 1.5)
+                tp_price = round(exec_price - tp_span, digits)
+
+        # Post-slippage strategy DB min_rr compliance check before live order_send
+        final_sl_dist = abs(exec_price - sl_price)
+        final_tp_dist = abs(tp_price - exec_price)
+        live_rr = (final_tp_dist / final_sl_dist) if final_sl_dist > 0 else 0.0
+        if strategy_min_rr > 0 and (live_rr + 0.02) < strategy_min_rr:
+            snap, open_pos, pending_ord, deals = collect_account_telemetry()
+            post_callback(callback_url, callback_token, {
+                "idempotency_key": idempotency_key,
+                "status": "BROKER_REJECTED",
+                "dry_run": False,
+                "symbol": requested_sym,
+                "broker_symbol": broker_sym,
+                "account_mode": "DEMO",
+                "broker_message": f"STRATEGY_RR_COMPLIANCE_BLOCK: Live R:R 1:{live_rr:.2f} at fill price {exec_price} violates strategy DB minimum 1:{strategy_min_rr:.2f} ({payload.get('strategy')}).",
+                "account_snapshot": snap,
+                "open_positions": open_pos,
+                "pending_orders": pending_ord,
+                "recent_deals": deals,
+            })
+            return 0
 
         sizing_mode = str(payload.get("sizing_mode") or "RISK_PERCENT").upper()
         live_bal_used = float(acc.balance or 0.0)
