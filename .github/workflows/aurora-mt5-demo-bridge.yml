@@ -117,11 +117,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.12 (with pip cache to minimize runner minutes)
+      - name: Setup Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: 'pip'
 
       - name: Restore cached Python MT5 virtualenv (skips pip install on hit)
         id: venv-cache
@@ -266,6 +265,7 @@ jobs:
           BRIDGE_CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
           AURORA_CALLBACK_URL: https://trade.eunknowntech.com/api/broker/github/callback
           IDEMPOTENCY_KEY: ${{ github.event.client_payload.idempotency_key || format('ghrun_{0}', github.run_id) }}
+          DISPATCH_PAYLOAD_JSON: ${{ toJson(github.event.client_payload) }}
           SYMBOL_NAME: ${{ github.event.client_payload.symbol || 'ACCOUNT_SYNC' }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_SERVER_URL: ${{ github.server_url }}
@@ -273,9 +273,21 @@ jobs:
         run: |
           $cbToken = ($env:BRIDGE_CALLBACK_TOKEN -replace '[\r\n\0]', '').Trim()
           if (-not $cbToken) { exit 0 }
+          $resolvedKey = $env:IDEMPOTENCY_KEY
+          try {
+            if ($env:DISPATCH_PAYLOAD_JSON) {
+              $outer = $env:DISPATCH_PAYLOAD_JSON | ConvertFrom-Json
+              if ($outer.payload_json) {
+                $inner = $outer.payload_json | ConvertFrom-Json
+                if ($inner.idempotency_key) { $resolvedKey = [string]$inner.idempotency_key }
+              } elseif ($outer.idempotency_key) {
+                $resolvedKey = [string]$outer.idempotency_key
+              }
+            }
+          } catch {}
           $runUrl = "$($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)/actions/runs/$($env:GITHUB_RUN_ID)"
           $payload = @{
-            idempotency_key = $env:IDEMPOTENCY_KEY
+            idempotency_key = $resolvedKey
             status = "BROKER_REJECTED"
             symbol = $env:SYMBOL_NAME
             broker_message = "GitHub Actions runner failed before MT5 callback (Run #$($env:GITHUB_RUN_ID)). Inspect logs: $runUrl"
