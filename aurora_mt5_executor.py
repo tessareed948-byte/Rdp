@@ -817,6 +817,41 @@ def main() -> int:
             })
             return 0
 
+        # HARD MINIMUM STRUCTURAL SL PIP FLOOR (eliminates 5.5-pip EURGBP noise stop-outs & 15-lot explosions!)
+        if entry_req > 0 and sl_req > 0:
+            sl_dist_req = abs(entry_req - sl_req)
+            if base_sym.startswith(("BTC", "ETH", "SOL")):
+                min_sl_req = entry_req * 0.004
+                min_sl_label = "0.40%"
+            elif "XAU" in base_sym:
+                min_sl_req = 4.50
+                min_sl_label = "45 pips ($4.50)"
+            elif "XAG" in base_sym:
+                min_sl_req = 0.20
+                min_sl_label = "20 pips ($0.20)"
+            elif base_sym.endswith("JPY"):
+                min_sl_req = 0.22
+                min_sl_label = "22 pips"
+            else:
+                min_sl_req = 0.0015
+                min_sl_label = "15 pips"
+            if sl_dist_req < min_sl_req * 0.92:
+                snap, open_pos, pending_ord, deals = collect_account_telemetry()
+                post_callback(callback_url, callback_token, {
+                    "idempotency_key": idempotency_key,
+                    "status": "BROKER_REJECTED",
+                    "dry_run": False,
+                    "symbol": requested_sym,
+                    "broker_symbol": broker_sym,
+                    "account_mode": "DEMO",
+                    "broker_message": f"SL_FLOOR_BLOCK: {base_sym} SL distance {sl_dist_req:.5f} is tighter than structural minimum {min_sl_label} — blocking noise stop-out & lot explosion.",
+                    "account_snapshot": snap,
+                    "open_positions": open_pos,
+                    "pending_orders": pending_ord,
+                    "recent_deals": deals,
+                })
+                return 0
+
         # HARD LIVE ANTI-HEDGING GUARD: refuse ANY new order if pair already has an open position OR pending order (either direction!)
         for existing_pos in (mt5.positions_get() or []):
             if norm_symbol(existing_pos.symbol) == base_sym:
