@@ -1,0 +1,52 @@
+name: Autonomous RR+ Scanner, Trade Monitor & Pre-London Self-Upgrade
+
+on:
+  schedule:
+    # 1. Peak London & NY Overlap Killzone (07:00 - 15:45 UTC Mon-Fri): scans FX, Metals & Crypto every 15m
+    - cron: '*/15 7-15 * * 1-5'
+    # 2. 24/7 Every 2 Hours (including Sat-Sun): scans Crypto (BTC/ETH/SOL) + protects open MT5 trades
+    - cron: '0 */2 * * *'
+    # 3. Daily Pre-London Self-Upgrade Audit (06:00 UTC Mon-Fri): optimizes strategies, entry models & wait times
+    - cron: '0 6 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  trigger-vercel-rr-plus-cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Run Daily Pre-London Self-Upgrade & Auto-Push Check (06:00 UTC)
+        if: ${{ github.event.schedule == '0 6 * * 1-5' || github.event_name == 'workflow_dispatch' }}
+        env:
+          CRON_SECRET: ${{ secrets.VERCEL_CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -X POST "https://trade.eunknowntech.com/api/cron/self-upgrade" \
+            -A "AuroraTrade-SelfUpgrade/1.0" \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: $CRON_SECRET" \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            -d '{"force":false}' | jq .
+
+      - name: Run Zero-Token Deterministic Multi-Asset Scan + >85% Confidence Auto-Trade Dispatch
+        if: ${{ github.event.schedule != '0 6 * * 1-5' }}
+        env:
+          CRON_SECRET: ${{ secrets.VERCEL_CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -X POST "https://trade.eunknowntech.com/api/automation/cycle" \
+            -A "AuroraTrade-AutoScanner/1.0" \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: $CRON_SECRET" \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            -d '{"style":"DAY_TRADING","useGeminiGate":false,"dispatchToGitHub":true}' | jq .
+
+      - name: Trigger Trade Monitor & Open Position Profit-Protection Tick
+        if: ${{ always() && github.event.schedule != '0 6 * * 1-5' }}
+        env:
+          CRON_SECRET: ${{ secrets.VERCEL_CRON_SECRET }}
+        run: |
+          curl -fsSL -X POST "https://trade.eunknowntech.com/api/cron/trade-monitor" \
+            -A "AuroraTrade-Monitor/1.0" \
+            -H "X-API-Key: $CRON_SECRET" \
+            -H "Authorization: Bearer $CRON_SECRET" | jq . || true
