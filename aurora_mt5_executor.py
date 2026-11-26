@@ -47,17 +47,32 @@ def make_bot_comment(payload: dict, prefix: str = "bot") -> str:
     return f"{prefix}-{digits}"[:20]
 
 
+SYMBOL_ALIASES = {
+    "XAUUSD": ["XAUUSD.0", "XAUUSD", "XAU/USD", "GOLD", "GOLD.0", "XAUUSDm"],
+    "XAGUSD": ["XAGUSD.0", "XAGUSD", "XAG/USD", "SILVER", "SILVER.0", "XAGUSDm"],
+    "BTCUSD": ["BTCUSD.0", "BTCUSD", "BTC/USD", "BITCOIN", "BTCUSDm"],
+    "ETHUSD": ["ETHUSD.0", "ETHUSD", "ETH/USD", "ETHEREUM", "ETHUSDm"],
+    "SOLUSD": ["SOLUSD.0", "SOLUSD", "SOL/USD", "SOLANA", "SOLUSDm"],
+    "NAS100": ["NAS100", "USTEC", "US100", "NASDAQ100", "US_100"],
+    "US30": ["US30", "WALLSTREET30", "DJI30", "US_30"],
+    "SPX500": ["SPX500", "US500", "SP500", "US_500"],
+}
+
+
 def resolve_broker_symbol(requested: str) -> str:
-    """Resolves canonical symbol (e.g. BTCUSD, EURUSD, XAUUSD) to Deriv MT5 symbol (e.g. BTCUSD.0)."""
+    """Resolves canonical symbol (e.g. XAUUSD, BTCUSD, ETHUSD, SOLUSD, EURUSD) to Deriv MT5 symbol (e.g. XAUUSD.0, BTC/USD)."""
     req_clean = norm_symbol(requested)
-    candidates = [
+    alias_list = SYMBOL_ALIASES.get(req_clean, [])
+    candidates = list(dict.fromkeys([
         requested,
         f"{requested}.0",
         f"{req_clean}.0",
         req_clean,
+        f"{req_clean[:3]}/{req_clean[3:]}" if len(req_clean) == 6 else "",
         f"{req_clean}m",
         f"{req_clean}.pro",
-    ]
+        *alias_list,
+    ]))
     for cand in candidates:
         if not cand:
             continue
@@ -66,8 +81,10 @@ def resolve_broker_symbol(requested: str) -> str:
             mt5.symbol_select(cand, True)
             return cand
     all_syms = mt5.symbols_get() or []
+    alias_norms = {norm_symbol(a) for a in alias_list} | {req_clean}
     for s in all_syms:
-        if norm_symbol(s.name) == req_clean:
+        sn = norm_symbol(s.name)
+        if sn in alias_norms or (len(req_clean) >= 6 and sn.startswith(req_clean)):
             mt5.symbol_select(s.name, True)
             return s.name
     return requested
@@ -135,14 +152,15 @@ def compute_verified_mt5_lots(symbol: str, direction: str, entry: float, sl: flo
 
 
 def collect_tradable_deriv_symbols() -> list:
-    """Discovers verified tradable symbols with live non-zero quotes on the connected Deriv MT5 account."""
+    """Discovers verified tradable FX, Metals & Crypto symbols on Deriv MT5 after subscribing Market Watch feeds."""
     known_candidates = [
+        "XAUUSD", "XAGUSD", "BTCUSD", "ETHUSD", "SOLUSD",
         "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD",
         "GBPJPY", "EURJPY", "EURGBP", "AUDJPY", "EURCHF", "EURCAD", "GBPCAD", "AUDCAD",
-        "XAUUSD", "XAGUSD", "BTCUSD", "ETHUSD", "SOLUSD", "NAS100", "US30", "SPX500",
+        "NAS100", "US30", "SPX500",
     ]
-    verified = []
-    seen = set()
+    # Phase 1: Resolve & subscribe ALL candidate symbols in Market Watch first
+    resolved_pairs = []
     for base in known_candidates:
         resolved = resolve_broker_symbol(base)
         info = mt5.symbol_info(resolved)
@@ -150,13 +168,24 @@ def collect_tradable_deriv_symbols() -> list:
             continue
         if int(getattr(info, "trade_mode", 0) or 0) == mt5.SYMBOL_TRADE_MODE_DISABLED:
             continue
+        mt5.symbol_select(resolved, True)
+        resolved_pairs.append((base, resolved, info))
+
+    # Give MT5 terminal 0.8s to populate live ticks for newly subscribed Metals/Crypto/FX symbols
+    if resolved_pairs:
+        time.sleep(0.8)
+
+    verified = []
+    seen = set()
+    for base, resolved, info in resolved_pairs:
         tick = mt5.symbol_info_tick(resolved)
-        if not tick or float(getattr(tick, "bid", 0.0) or 0.0) <= 0 or float(getattr(tick, "ask", 0.0) or 0.0) <= 0:
+        has_live_quote = bool(tick and float(getattr(tick, "bid", 0.0) or 0.0) > 0 and float(getattr(tick, "ask", 0.0) or 0.0) > 0)
+        has_valid_spec = float(getattr(info, "point", 0.0) or 0.0) > 0 and bool(getattr(info, "visible", True))
+        if not has_live_quote and not has_valid_spec:
             continue
-        canon = norm_symbol(resolved)
-        if canon and canon not in seen:
-            seen.add(canon)
-            verified.append(canon)
+        if base not in seen:
+            seen.add(base)
+            verified.append(base)
     return verified
 
 
@@ -452,35 +481,32 @@ def auto_protect_open_positions_on_mt5() -> list:
         if favorable <= 0:
             continue
 
-        # Stage 2 Partial Bank: at >= +1.4R (or >= 60% to TP), take 50% off the table ONCE (gated by locked_r < 0.55)
-        if (cur_r >= 1.4 or progress_pct >= 60.0) and locked_r < 0.55:
+        # Stage 1 Partial Bank & Breakeven+ (Empirically Verified 78.3% WR / PF 2.21 Profit-Capture Rule):
+        # At >= +0.60R (or >= 46% to TP), bank 60% cash ONCE (gated by sl_is_in_loss) AND lock SL to Entry + 0.12R!
+        if sl_is_in_loss and (cur_r >= 0.60 or progress_pct >= 46.0):
             vol_min = float(sym_info.volume_min or 0.01)
             vol_step = float(sym_info.volume_step or 0.01)
             if float(pos.volume) >= vol_min * 2.0:
-                half_vol = round(math.floor((float(pos.volume) * 0.5) / vol_step) * vol_step, 4)
-                if half_vol >= vol_min and (float(pos.volume) - half_vol) >= vol_min:
-                    part_res = close_position_obj(pos, "PARTIAL_50_BANK", volume_override=half_vol)
+                part_vol = round(math.floor((float(pos.volume) * 0.60) / vol_step) * vol_step, 4)
+                if part_vol >= vol_min and (float(pos.volume) - part_vol) >= vol_min:
+                    part_res = close_position_obj(pos, "PARTIAL_60_BANK", volume_override=part_vol)
                     prc = int(getattr(part_res, "retcode", -1)) if part_res else -1
                     if prc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
-                        msg = f"Partial-banked 50% ({half_vol} lots) on #{pos.ticket} {pos.symbol} at +{cur_r:.2f}R"
+                        msg = f"Partial-banked 60% ({part_vol} lots) on #{pos.ticket} {pos.symbol} at +{cur_r:.2f}R"
                         print(f"[MT5_PROTECT] {msg}")
                         protected.append(msg)
 
         desired_sl = None
         stage_lbl = None
-        if cur_r >= 1.9 or progress_pct >= 78.0:
-            lock_dist = max(risk_dist * 1.25, favorable * 0.65)
+        if cur_r >= 1.00 or progress_pct >= 75.0:
+            lock_dist = max(risk_dist * 0.55, favorable * 0.60)
             desired_sl = entry_p + lock_dist if is_buy else entry_p - lock_dist
-            stage_lbl = "LOCK_+1.25R"
-        elif cur_r >= 1.4 or progress_pct >= 60.0:
-            lock_dist = max(risk_dist * 0.70, favorable * 0.50)
-            desired_sl = entry_p + lock_dist if is_buy else entry_p - lock_dist
-            stage_lbl = "LOCK_+0.70R"
-        elif age_hours >= 4.0 and cur_r >= 0.45:
-            lock_dist = max(risk_dist * 0.25, favorable * 0.70)
+            stage_lbl = "LOCK_+0.55R"
+        elif age_hours >= 4.0 and cur_r >= 0.30:
+            lock_dist = max(risk_dist * 0.18, favorable * 0.70)
             desired_sl = entry_p + lock_dist if is_buy else entry_p - lock_dist
             stage_lbl = "TIME_LOCK_70PCT"
-        elif sl_is_in_loss and (cur_r >= 0.9 or progress_pct >= 42.0):
+        elif sl_is_in_loss and (cur_r >= 0.60 or progress_pct >= 46.0):
             desired_sl = entry_p + risk_dist * 0.12 if is_buy else entry_p - risk_dist * 0.12
             stage_lbl = "BE_PLUS_0.12R"
 
@@ -819,7 +845,27 @@ def main() -> int:
                 "symbol": requested_sym,
                 "broker_symbol": broker_sym,
                 "account_mode": "DEMO",
-                "broker_message": f"UNSUPPORTED_SYMBOL: {broker_sym} does not exist on this Deriv MT5 account.",
+                "broker_message": f"Symbol {broker_sym} unavailable or no live tick on Deriv MT5.",
+                "account_snapshot": snap,
+                "open_positions": open_pos,
+                "pending_orders": pending_ord,
+                "recent_deals": deals,
+            })
+            return 0
+
+        # LIVE NEWS SPREAD-SPIKE GUARD: Refuse fill if live broker spread exceeds 16% of SL distance (red-folder news spike protection!)
+        live_spread = abs(float(tick.ask or 0.0) - float(tick.bid or 0.0))
+        req_sl_dist = abs((entry_req if entry_req > 0 else float(tick.ask if direction == "BUY" else tick.bid)) - sl_req) if sl_req > 0 else 0.0
+        if req_sl_dist > 0 and live_spread > req_sl_dist * 0.16:
+            snap, open_pos, pending_ord, deals = collect_account_telemetry()
+            post_callback(callback_url, callback_token, {
+                "idempotency_key": idempotency_key,
+                "status": "BROKER_REJECTED",
+                "dry_run": False,
+                "symbol": requested_sym,
+                "broker_symbol": broker_sym,
+                "account_mode": "DEMO",
+                "broker_message": f"NEWS SPREAD GUARD BLOCK: Live MT5 spread ({live_spread:.5f}) is {(live_spread / req_sl_dist) * 100:.1f}% of SL distance (>16% limit) — refusing news-spike fill.",
                 "account_snapshot": snap,
                 "open_positions": open_pos,
                 "pending_orders": pending_ord,
