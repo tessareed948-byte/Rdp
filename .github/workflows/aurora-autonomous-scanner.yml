@@ -10,6 +10,9 @@ on:
     - cron: '0 6 * * 1-5'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   trigger-vercel-rr-plus-cycle:
     runs-on: ubuntu-latest
@@ -22,13 +25,18 @@ jobs:
           BRIDGE_CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
         run: |
           set -euo pipefail
-          curl -fsS --max-time 55 -X POST "https://trade.eunknowntech.com/api/cron/self-upgrade" \
+          RESP=$(curl -sS --max-time 55 -w "\n%{http_code}" -X POST "https://trade.eunknowntech.com/api/cron/self-upgrade" \
             -A "AuroraTrade-SelfUpgrade/1.0" \
             -H "Content-Type: application/json" \
             -H "X-API-Key: $CRON_SECRET" \
             -H "X-Bridge-Callback-Token: $BRIDGE_CALLBACK_TOKEN" \
             -H "Authorization: Bearer $CRON_SECRET" \
-            -d '{"force":false}'
+            -d '{"force":false}')
+          CODE=$(echo "$RESP" | tail -n1)
+          BODY=$(echo "$RESP" | sed '$d')
+          echo "SELF_UPGRADE_HTTP=$CODE"
+          echo "$BODY" | head -c 500
+          if [ "$CODE" -lt 200 ] || [ "$CODE" -ge 300 ]; then exit 1; fi
 
       - name: Run Zero-Token Deterministic Multi-Asset Scan + >85% Confidence Auto-Trade Dispatch
         if: ${{ github.event.schedule != '0 6 * * 1-5' }}
@@ -37,13 +45,18 @@ jobs:
           BRIDGE_CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
         run: |
           set -euo pipefail
-          curl -fsS --max-time 55 -X POST "https://trade.eunknowntech.com/api/automation/cycle" \
+          RESP=$(curl -sS --max-time 55 -w "\n%{http_code}" -X POST "https://trade.eunknowntech.com/api/automation/cycle" \
             -A "AuroraTrade-AutoScanner/1.0" \
             -H "Content-Type: application/json" \
             -H "X-API-Key: $CRON_SECRET" \
             -H "X-Bridge-Callback-Token: $BRIDGE_CALLBACK_TOKEN" \
             -H "Authorization: Bearer $CRON_SECRET" \
-            -d '{"style":"DAY_TRADING","useGeminiGate":false,"dispatchToGitHub":true}'
+            -d '{"style":"DAY_TRADING","useGeminiGate":false,"dispatchToGitHub":true}')
+          CODE=$(echo "$RESP" | tail -n1)
+          BODY=$(echo "$RESP" | sed '$d')
+          echo "AUTOMATION_CYCLE_HTTP=$CODE"
+          echo "$BODY" | head -c 500
+          if [ "$CODE" -lt 200 ] || [ "$CODE" -ge 300 ]; then exit 1; fi
 
       - name: Trigger Trade Monitor & Open Position Profit-Protection Tick
         if: ${{ always() && github.event.schedule != '0 6 * * 1-5' }}
@@ -51,8 +64,10 @@ jobs:
           CRON_SECRET: ${{ secrets.VERCEL_CRON_SECRET || secrets.CRON_SECRET || secrets.BRIDGE_CALLBACK_TOKEN }}
           BRIDGE_CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
         run: |
-          curl -fsS --max-time 55 -X POST "https://trade.eunknowntech.com/api/cron/trade-monitor" \
+          RESP=$(curl -sS --max-time 55 -w "\n%{http_code}" -X POST "https://trade.eunknowntech.com/api/cron/trade-monitor" \
             -A "AuroraTrade-Monitor/1.0" \
             -H "X-API-Key: $CRON_SECRET" \
             -H "X-Bridge-Callback-Token: $BRIDGE_CALLBACK_TOKEN" \
-            -H "Authorization: Bearer $CRON_SECRET" || true
+            -H "Authorization: Bearer $CRON_SECRET") || true
+          CODE=$(echo "$RESP" | tail -n1)
+          echo "TRADE_MONITOR_HTTP=$CODE"
