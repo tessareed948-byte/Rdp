@@ -111,7 +111,7 @@ jobs:
     name: Execute on Deriv MT5 (Fast Direct Windows Runner)
     needs: watchdog-preflight
     if: ${{ always() && (needs.watchdog-preflight.result == 'skipped' || needs.watchdog-preflight.outputs.proceed == 'true') }}
-    runs-on: windows-2022
+    runs-on: windows-latest
     timeout-minutes: 8
     steps:
       - name: Checkout repository
@@ -128,7 +128,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\mt5_venv
-          key: mt5-py-${{ steps.setup-py.outputs.python-version }}-5.0.6231-win2022
+          key: mt5-py-${{ runner.os }}-${{ steps.setup-py.outputs.python-version }}-5.0.6231
 
       - name: Verify or self-heal Python MT5 virtualenv
         shell: pwsh
@@ -162,8 +162,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\MT5
-          key: deriv-mt5-portable-v3-win2022
+          key: deriv-mt5-portable-v4-${{ runner.os }}
           restore-keys: |
+            deriv-mt5-portable-v4-
             deriv-mt5-portable-v3-
             deriv-mt5-portable-v2-
 
