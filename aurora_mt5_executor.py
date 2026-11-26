@@ -783,7 +783,7 @@ def main() -> int:
             })
             return 0
 
-        # 4. OPEN — Strict Live Anti-Hedging Guard + Smart Limit/Market Fill + Stops-Level Validation + Verified Balance Lot Sizing
+        # 4. OPEN — Strict >85% Confidence Score Filter + Live Anti-Hedging Guard + Smart Limit/Market Fill + Verified Lot Sizing
         requested_sym = str(payload.get("symbol") or "").upper()
         base_sym = norm_symbol(requested_sym)
         broker_sym = resolve_broker_symbol(requested_sym)
@@ -796,6 +796,26 @@ def main() -> int:
         max_lots = float(payload.get("max_lots") or 15.0)
         fallback_lots = float(payload.get("lot_size") or 0.01)
         bot_comment = make_bot_comment(payload, prefix="bot")
+
+        # STRICT >85% CONFIDENCE SCORE EXECUTION GATE (protects >=71% total bot win rate target)
+        sig_conf = float(payload.get("confidence") or 0.0)
+        min_conf_req = max(86.0, float(payload.get("min_confidence") or 86.0))
+        if sig_conf <= 85.0 or sig_conf < min_conf_req:
+            snap, open_pos, pending_ord, deals = collect_account_telemetry()
+            post_callback(callback_url, callback_token, {
+                "idempotency_key": idempotency_key,
+                "status": "BROKER_REJECTED",
+                "dry_run": False,
+                "symbol": requested_sym,
+                "broker_symbol": broker_sym,
+                "account_mode": "DEMO",
+                "broker_message": f"CONFIDENCE GATE BLOCK: Signal confidence {sig_conf:.1f}% is not >85% (requires >= {min_conf_req:.0f}%).",
+                "account_snapshot": snap,
+                "open_positions": open_pos,
+                "pending_orders": pending_ord,
+                "recent_deals": deals,
+            })
+            return 0
 
         # HARD LIVE ANTI-HEDGING GUARD: refuse ANY new order if pair already has an open position OR pending order (either direction!)
         for existing_pos in (mt5.positions_get() or []):
