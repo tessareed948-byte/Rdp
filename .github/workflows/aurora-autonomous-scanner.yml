@@ -18,35 +18,41 @@ jobs:
       - name: Run Daily Pre-London Self-Upgrade & Auto-Push Check (06:00 UTC)
         if: ${{ github.event.schedule == '0 6 * * 1-5' || github.event_name == 'workflow_dispatch' }}
         env:
-          CRON_SECRET: ${{ secrets.VERCEL_CRON_SECRET }}
+          CRON_SECRET: ${{ secrets.VERCEL_CRON_SECRET || secrets.CRON_SECRET || secrets.BRIDGE_CALLBACK_TOKEN }}
+          BRIDGE_CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
         run: |
           set -euo pipefail
-          curl -fsSL -X POST "https://trade.eunknowntech.com/api/cron/self-upgrade" \
+          curl -fsS --max-time 55 -X POST "https://trade.eunknowntech.com/api/cron/self-upgrade" \
             -A "AuroraTrade-SelfUpgrade/1.0" \
             -H "Content-Type: application/json" \
             -H "X-API-Key: $CRON_SECRET" \
+            -H "X-Bridge-Callback-Token: $BRIDGE_CALLBACK_TOKEN" \
             -H "Authorization: Bearer $CRON_SECRET" \
-            -d '{"force":false}' | jq .
+            -d '{"force":false}'
 
       - name: Run Zero-Token Deterministic Multi-Asset Scan + >85% Confidence Auto-Trade Dispatch
         if: ${{ github.event.schedule != '0 6 * * 1-5' }}
         env:
-          CRON_SECRET: ${{ secrets.VERCEL_CRON_SECRET }}
+          CRON_SECRET: ${{ secrets.VERCEL_CRON_SECRET || secrets.CRON_SECRET || secrets.BRIDGE_CALLBACK_TOKEN }}
+          BRIDGE_CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
         run: |
           set -euo pipefail
-          curl -fsSL -X POST "https://trade.eunknowntech.com/api/automation/cycle" \
+          curl -fsS --max-time 55 -X POST "https://trade.eunknowntech.com/api/automation/cycle" \
             -A "AuroraTrade-AutoScanner/1.0" \
             -H "Content-Type: application/json" \
             -H "X-API-Key: $CRON_SECRET" \
+            -H "X-Bridge-Callback-Token: $BRIDGE_CALLBACK_TOKEN" \
             -H "Authorization: Bearer $CRON_SECRET" \
-            -d '{"style":"DAY_TRADING","useGeminiGate":false,"dispatchToGitHub":true}' | jq .
+            -d '{"style":"DAY_TRADING","useGeminiGate":false,"dispatchToGitHub":true}'
 
       - name: Trigger Trade Monitor & Open Position Profit-Protection Tick
         if: ${{ always() && github.event.schedule != '0 6 * * 1-5' }}
         env:
-          CRON_SECRET: ${{ secrets.VERCEL_CRON_SECRET }}
+          CRON_SECRET: ${{ secrets.VERCEL_CRON_SECRET || secrets.CRON_SECRET || secrets.BRIDGE_CALLBACK_TOKEN }}
+          BRIDGE_CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
         run: |
-          curl -fsSL -X POST "https://trade.eunknowntech.com/api/cron/trade-monitor" \
+          curl -fsS --max-time 55 -X POST "https://trade.eunknowntech.com/api/cron/trade-monitor" \
             -A "AuroraTrade-Monitor/1.0" \
             -H "X-API-Key: $CRON_SECRET" \
-            -H "Authorization: Bearer $CRON_SECRET" | jq . || true
+            -H "X-Bridge-Callback-Token: $BRIDGE_CALLBACK_TOKEN" \
+            -H "Authorization: Bearer $CRON_SECRET" || true
