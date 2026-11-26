@@ -139,7 +139,7 @@ def collect_tradable_deriv_symbols() -> list:
     known_candidates = [
         "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD",
         "GBPJPY", "EURJPY", "EURGBP", "AUDJPY", "EURCHF", "EURCAD", "GBPCAD", "AUDCAD",
-        "XAUUSD", "XAGUSD", "NAS100", "US30", "SPX500", "BTCUSD", "ETHUSD",
+        "XAUUSD", "XAGUSD", "BTCUSD", "ETHUSD", "SOLUSD", "NAS100", "US30", "SPX500",
     ]
     verified = []
     seen = set()
@@ -433,7 +433,7 @@ def auto_protect_open_positions_on_mt5() -> list:
 
         # Stage 4B/4C: Intraday 5.5h+ Time-Decay Bank / Dead-Chop Exit (stops 6-hour trades from reversing!)
         if age_hours >= 5.5 and cur_r >= 0.35:
-            close_res = close_position_by_obj(pos, f"TIME_DECAY_BANK_{age_hours:.1f}H")
+            close_res = close_position_obj(pos, f"TIME_DECAY_BANK_{age_hours:.1f}H")
             rc = int(getattr(close_res, "retcode", -1)) if close_res else -1
             if rc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
                 msg = f"Time-decay profit bank #{pos.ticket} {pos.symbol} after {age_hours:.1f}h at +{cur_r:.2f}R (prevented reversal)"
@@ -441,7 +441,7 @@ def auto_protect_open_positions_on_mt5() -> list:
                 protected.append(msg)
                 continue
         if age_hours >= 6.5 and -0.35 <= cur_r <= 0.35:
-            close_res = close_position_by_obj(pos, f"TIME_DECAY_FLAT_{age_hours:.1f}H")
+            close_res = close_position_obj(pos, f"TIME_DECAY_FLAT_{age_hours:.1f}H")
             rc = int(getattr(close_res, "retcode", -1)) if close_res else -1
             if rc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
                 msg = f"Time-decay dead-chop close #{pos.ticket} {pos.symbol} after {age_hours:.1f}h at {cur_r:+.2f}R"
@@ -459,7 +459,7 @@ def auto_protect_open_positions_on_mt5() -> list:
             if float(pos.volume) >= vol_min * 2.0:
                 half_vol = round(math.floor((float(pos.volume) * 0.5) / vol_step) * vol_step, 4)
                 if half_vol >= vol_min and (float(pos.volume) - half_vol) >= vol_min:
-                    part_res = close_position_by_obj(pos, "PARTIAL_50_BANK", volume_override=half_vol)
+                    part_res = close_position_obj(pos, "PARTIAL_50_BANK", volume_override=half_vol)
                     prc = int(getattr(part_res, "retcode", -1)) if part_res else -1
                     if prc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
                         msg = f"Partial-banked 50% ({half_vol} lots) on #{pos.ticket} {pos.symbol} at +{cur_r:.2f}R"
