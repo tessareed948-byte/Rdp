@@ -112,50 +112,67 @@ jobs:
     needs: watchdog-preflight
     if: ${{ always() && (needs.watchdog-preflight.result == 'skipped' || needs.watchdog-preflight.outputs.proceed == 'true') }}
     runs-on: windows-2022
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python 3.12
+        id: setup-py
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Restore cached Python MT5 virtualenv (skips pip install on hit)
+      - name: Restore cached Python MT5 virtualenv (exact Python patch key)
         id: venv-cache
         uses: actions/cache@v4
         with:
           path: C:\mt5_venv
-          key: mt5-py312-venv-5.0.6231-win2022
-          restore-keys: |
-            mt5-py312-venv-
+          key: mt5-py-${{ steps.setup-py.outputs.python-version }}-5.0.6231-win2022
 
-      - name: Create venv & install MetaTrader5 Python package (only on cache miss)
-        if: steps.venv-cache.outputs.cache-hit != 'true'
+      - name: Verify or self-heal Python MT5 virtualenv
         shell: pwsh
         run: |
-          if (-not (Test-Path "C:\mt5_venv\Scripts\python.exe")) {
-            python -m venv C:\mt5_venv
+          $venvPy = "C:\mt5_venv\Scripts\python.exe"
+          $venvOk = $false
+          if (Test-Path $venvPy) {
+            try {
+              & $venvPy -c "import MetaTrader5; print(MetaTrader5.__version__)"
+              if ($LASTEXITCODE -eq 0) { $venvOk = $true }
+            } catch {
+              $venvOk = $false
+            }
           }
-          C:\mt5_venv\Scripts\pip.exe install --quiet --disable-pip-version-check MetaTrader5==5.0.6231
+          if ($venvOk) {
+            Write-Host "Cached C:\mt5_venv verified healthy."
+            exit 0
+          }
+          Write-Host "Creating/rebuilding C:\mt5_venv with MetaTrader5..."
+          if (Test-Path "C:\mt5_venv") { Remove-Item "C:\mt5_venv" -Recurse -Force -ErrorAction SilentlyContinue }
+          python -m venv C:\mt5_venv
+          & C:\mt5_venv\Scripts\pip.exe install --quiet --disable-pip-version-check MetaTrader5==5.0.6231
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Pinned MetaTrader5==5.0.6231 install failed; installing latest MetaTrader5 wheel..."
+            & C:\mt5_venv\Scripts\pip.exe install --quiet --disable-pip-version-check MetaTrader5
+          }
+          & $venvPy -c "import MetaTrader5; print('Installed MetaTrader5', MetaTrader5.__version__)"
 
       - name: Restore cached Deriv MT5 terminal (avoids download.mql5.com timeouts)
         id: mt5-cache
         uses: actions/cache@v4
         with:
           path: C:\MT5
-          key: deriv-mt5-portable-v2-win2022
+          key: deriv-mt5-portable-v3-win2022
           restore-keys: |
+            deriv-mt5-portable-v3-
             deriv-mt5-portable-v2-
 
-      - name: Download & install Deriv MT5 terminal (/portable) with multi-mirror retry
-        if: steps.mt5-cache.outputs.cache-hit != 'true'
+      - name: Verify or install Deriv MT5 terminal (/portable) with multi-mirror retry
         shell: pwsh
         run: |
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           if (Test-Path "C:\MT5\terminal64.exe") {
-            Write-Host "MT5 terminal64.exe already present in C:\MT5"
+            Write-Host "MT5 terminal64.exe verified in C:\MT5 (cache hit)."
             exit 0
           }
           $installer = "C:\deriv5setup.exe"
@@ -188,7 +205,19 @@ jobs:
             Write-Error "All MT5 installer mirrors failed to respond. Retry shortly or verify GitHub runner outbound network."
             exit 1
           }
-          Start-Process -FilePath $installer -ArgumentList '/auto', '/path:"C:\MT5"' -Wait
+          $proc = Start-Process -FilePath $installer -ArgumentList '/auto', '/path:"C:\MT5"' -PassThru
+          for ($w = 0; $w -lt 150; $w++) {
+            Start-Sleep -Seconds 1
+            if ($proc.HasExited) { break }
+            if ((Test-Path "C:\MT5\terminal64.exe") -and ((Get-Item "C:\MT5\terminal64.exe").Length -gt 5000000)) {
+              Start-Sleep -Seconds 5
+              break
+            }
+          }
+          if (-not $proc.HasExited) {
+            Write-Warning "Installer still running after terminal64.exe appeared; stopping installer process cleanly."
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
           if (-not (Test-Path "C:\MT5\terminal64.exe")) {
             Write-Error "Deriv MT5 terminal64.exe not found after install"
             exit 1
@@ -293,7 +322,7 @@ jobs:
             broker_message = "GitHub Actions runner failed before MT5 callback (Run #$($env:GITHUB_RUN_ID)). Inspect logs: $runUrl"
           } | ConvertTo-Json -Compress
           try {
-            Invoke-RestMethod -Method Post -Uri $env:AURORA_CALLBACK_URL -Headers @{ "X-Bridge-Callback-Token" = $cbToken } -ContentType "application/json" -Body $payload -TimeoutSec 20
+            Invoke-RestMethod -Method Post -Uri $env:AURORA_CALLBACK_URL -Headers @{ "X-Bridge-Callback-Token" = $cbToken; "User-Agent" = "AuroraMT5FailureReporter/1.0" } -ContentType "application/json" -Body $payload -TimeoutSec 20
           } catch {
             Write-Warning "Failure callback dispatch error: $($_.Exception.Message)"
           }
