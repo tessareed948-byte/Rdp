@@ -1,14 +1,17 @@
-name: Autonomous RR+ Scanner, Trade Monitor & Pre-London Self-Upgrade
+name: Autonomous 24/7 5m Zero-Gemini Scanner, Confirmation Watcher & Trade Monitor
 
 on:
   schedule:
-    # 1. Peak London & NY Overlap Killzone (07:00 - 15:45 UTC Mon-Fri): scans FX, Metals & Crypto every 15m
-    - cron: '*/15 7-15 * * 1-5'
-    # 2. 24/7 Every 2 Hours (including Sat-Sun): scans Crypto (BTC/ETH/SOL) + protects open MT5 trades
-    - cron: '0 */2 * * *'
-    # 3. Daily Pre-London Self-Upgrade Audit (06:00 UTC Mon-Fri): optimizes strategies, entry models & wait times
+    # 1. 24/7 High-Frequency Chart Watcher (every 5m): re-checks pending Break-and-Retest confirmations,
+    #    scans all open allowed pairs with 0 Gemini tokens (Free-First + Twelve Data On-Demand), and protects open trades
+    - cron: '*/5 * * * *'
+    # 2. Daily Pre-London Self-Upgrade Audit (06:00 UTC Mon-Fri): optimizes strategies, entry models & wait times
     - cron: '0 6 * * 1-5'
   workflow_dispatch:
+
+concurrency:
+  group: aurora-autonomous-scanner-24x7
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -40,7 +43,7 @@ jobs:
           echo ""
           if [ "$CODE" -lt 200 ] || [ "$CODE" -ge 300 ]; then exit 1; fi
 
-      - name: Run Zero-Token Deterministic Multi-Asset Scan + >85% Confidence Auto-Trade Dispatch
+      - name: Run 24/7 Zero-Gemini Deterministic Scan + Confirmation Recheck + Auto-Trade Dispatch
         if: ${{ github.event.schedule != '0 6 * * 1-5' }}
         env:
           CRON_SECRET: ${{ secrets.VERCEL_CRON_SECRET || secrets.CRON_SECRET || secrets.BRIDGE_CALLBACK_TOKEN }}
@@ -51,14 +54,14 @@ jobs:
           BRIDGE_CALLBACK_TOKEN=$(printf '%s' "${BRIDGE_CALLBACK_TOKEN:-}" | tr -d '\r\n')
           AUTH_KEY="${CRON_SECRET:-$BRIDGE_CALLBACK_TOKEN}"
           CODE=$(curl -sS --max-time 55 -o /tmp/auto_cycle.txt -w "%{http_code}" -X POST "https://trade.eunknowntech.com/api/automation/cycle" \
-            -A "AuroraTrade-AutoScanner/1.0" \
+            -A "AuroraTrade-AutoScanner/2.0" \
             -H "Content-Type: application/json" \
             -H "X-API-Key: $AUTH_KEY" \
             -H "X-Bridge-Callback-Token: $BRIDGE_CALLBACK_TOKEN" \
             -H "Authorization: Bearer $AUTH_KEY" \
-            -d '{"style":"DAY_TRADING","useGeminiGate":false,"dispatchToGitHub":true}')
+            -d '{"style":"DAY_TRADING","useGeminiGate":false,"dispatchToGitHub":true,"source":"github-actions-24x7-5m"}')
           echo "AUTOMATION_CYCLE_HTTP=$CODE"
-          head -c 500 /tmp/auto_cycle.txt || true
+          head -c 600 /tmp/auto_cycle.txt || true
           echo ""
           if [ "$CODE" -lt 200 ] || [ "$CODE" -ge 300 ]; then exit 1; fi
 
