@@ -279,26 +279,39 @@ def collect_account_telemetry():
 def post_callback(callback_url: str, token: str, body: dict):
     clean_url = re.sub(r"[\r\n\0]+", "", str(callback_url or "")).strip()
     clean_token = re.sub(r"[\r\n\0]+", "", str(token or "")).strip()
+    fallback_url = re.sub(
+        r"[\r\n\0]+",
+        "",
+        str(os.environ.get("AURORA_CALLBACK_URL") or "https://trade.eunknowntech.com/api/broker/github/callback"),
+    ).strip()
     print(f"[MT5_EXEC] status={body.get('status')} symbol={body.get('symbol')} msg={body.get('broker_message', '')}")
-    if not clean_url or not clean_token:
-        print("Callback URL or token missing; skipping callback.")
+    if not clean_token:
+        print("Callback token missing; skipping callback.")
         return
+    # Never route callbacks exclusively to ephemeral preview hosts (.run.app / localhost)
+    if (not clean_url) or (".run.app" in clean_url.lower()) or ("localhost" in clean_url.lower()) or ("127.0.0.1" in clean_url.lower()):
+        clean_url = fallback_url
+    candidate_urls = [clean_url]
+    if fallback_url and fallback_url != clean_url:
+        candidate_urls.append(fallback_url)
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        clean_url,
-        data=data,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "X-Bridge-Callback-Token": clean_token,
-            "User-Agent": "AuroraMT5Executor/2.1",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            print(f"Callback HTTP {resp.status}: {resp.read().decode('utf-8', errors='ignore')[:240]}")
-    except Exception as exc:
-        print(f"Callback warning: {exc}")
+    for target_url in candidate_urls:
+        req = urllib.request.Request(
+            target_url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Bridge-Callback-Token": clean_token,
+                "User-Agent": "AuroraMT5Executor/2.1",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                print(f"Callback HTTP {resp.status} ({target_url}): {resp.read().decode('utf-8', errors='ignore')[:240]}")
+                return
+        except Exception as exc:
+            print(f"Callback warning ({target_url}): {exc}")
 
 
 def close_position_obj(pos, close_comment: str, volume_override: float = None):
@@ -907,10 +920,12 @@ def main() -> int:
             })
             return 0
 
-        # LIVE NEWS SPREAD-SPIKE GUARD: Refuse fill if live broker spread exceeds 16% of SL distance (red-folder news spike protection!)
+        # LIVE NEWS SPREAD-SPIKE GUARD: Refuse fill if live broker spread exceeds threshold of SL distance (Crypto=25%, FX/Metals=16%)
         live_spread = abs(float(tick.ask or 0.0) - float(tick.bid or 0.0))
         req_sl_dist = abs((entry_req if entry_req > 0 else float(tick.ask if direction == "BUY" else tick.bid)) - sl_req) if sl_req > 0 else 0.0
-        if req_sl_dist > 0 and live_spread > req_sl_dist * 0.16:
+        is_crypto_sym = any(requested_sym.upper().startswith(p) for p in ("BTC", "ETH", "SOL"))
+        max_spread_ratio = 0.25 if is_crypto_sym else 0.16
+        if req_sl_dist > 0 and live_spread > req_sl_dist * max_spread_ratio:
             snap, open_pos, pending_ord, deals = collect_account_telemetry()
             post_callback(callback_url, callback_token, {
                 "idempotency_key": idempotency_key,
@@ -919,7 +934,7 @@ def main() -> int:
                 "symbol": requested_sym,
                 "broker_symbol": broker_sym,
                 "account_mode": "DEMO",
-                "broker_message": f"NEWS SPREAD GUARD BLOCK: Live MT5 spread ({live_spread:.5f}) is {(live_spread / req_sl_dist) * 100:.1f}% of SL distance (>16% limit) — refusing news-spike fill.",
+                "broker_message": f"NEWS SPREAD GUARD BLOCK: Live MT5 spread ({live_spread:.5f}) is {(live_spread / req_sl_dist) * 100:.1f}% of SL distance (>{int(max_spread_ratio * 100)}% limit) — refusing news-spike fill.",
                 "account_snapshot": snap,
                 "open_positions": open_pos,
                 "pending_orders": pending_ord,
