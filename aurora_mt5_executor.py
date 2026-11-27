@@ -60,7 +60,7 @@ SYMBOL_ALIASES = {
 
 
 def resolve_broker_symbol(requested: str) -> str:
-    """Resolves canonical symbol (e.g. XAUUSD, BTCUSD, ETHUSD, SOLUSD, EURUSD) to Deriv MT5 symbol (e.g. XAUUSD.0, BTC/USD)."""
+    """Resolves canonical symbol (e.g. XAUUSD, BTCUSD, ETHUSD, SOLUSD, EURUSD) to a tradable Deriv MT5 symbol with live quotes."""
     req_clean = norm_symbol(requested)
     alias_list = SYMBOL_ALIASES.get(req_clean, [])
     candidates = list(dict.fromkeys([
@@ -73,21 +73,33 @@ def resolve_broker_symbol(requested: str) -> str:
         f"{req_clean}.pro",
         *alias_list,
     ]))
+    matched_candidates = []
     for cand in candidates:
         if not cand:
             continue
         info = mt5.symbol_info(cand)
-        if info is not None:
+        if info is not None and int(getattr(info, "trade_mode", 0) or 0) != mt5.SYMBOL_TRADE_MODE_DISABLED:
             mt5.symbol_select(cand, True)
-            return cand
-    all_syms = mt5.symbols_get() or []
-    alias_norms = {norm_symbol(a) for a in alias_list} | {req_clean}
-    for s in all_syms:
-        sn = norm_symbol(s.name)
-        if sn in alias_norms or (len(req_clean) >= 6 and sn.startswith(req_clean)):
-            mt5.symbol_select(s.name, True)
-            return s.name
-    return requested
+            matched_candidates.append(cand)
+    if not matched_candidates:
+        all_syms = mt5.symbols_get() or []
+        alias_norms = {norm_symbol(a) for a in alias_list} | {req_clean}
+        for s in all_syms:
+            sn = norm_symbol(s.name)
+            if sn in alias_norms or (len(req_clean) >= 6 and sn.startswith(req_clean)):
+                if int(getattr(s, "trade_mode", 0) or 0) != mt5.SYMBOL_TRADE_MODE_DISABLED:
+                    mt5.symbol_select(s.name, True)
+                    matched_candidates.append(s.name)
+    if not matched_candidates:
+        return requested
+    # Poll briefly so freshly subscribed Deriv MT5 symbols (BTCUSD/ETHUSD/XAUUSD) deliver a live non-zero bid/ask quote
+    for _wait_idx in range(8):
+        for cand in matched_candidates:
+            tk = mt5.symbol_info_tick(cand)
+            if tk and float(getattr(tk, "bid", 0.0) or 0.0) > 0.0 and float(getattr(tk, "ask", 0.0) or 0.0) > 0.0:
+                return cand
+        time.sleep(0.3)
+    return matched_candidates[0]
 
 
 def resolve_filling_mode(sym_info) -> int:
@@ -901,8 +913,16 @@ def main() -> int:
                 })
                 return 0
 
+        mt5.symbol_select(broker_sym, True)
         sym_info = mt5.symbol_info(broker_sym)
         tick = mt5.symbol_info_tick(broker_sym)
+        # Wait up to 3.6s for fresh MT5 runner Market Watch tick warmup (prevents cold bid=0.0/ask=0.0 on BTCUSD.0/XAUUSD.0)
+        for _tick_try in range(12):
+            if sym_info and tick and float(getattr(tick, "bid", 0.0) or 0.0) > 0.0 and float(getattr(tick, "ask", 0.0) or 0.0) > 0.0:
+                break
+            time.sleep(0.3)
+            sym_info = mt5.symbol_info(broker_sym)
+            tick = mt5.symbol_info_tick(broker_sym)
         if not sym_info or not tick:
             snap, open_pos, pending_ord, deals = collect_account_telemetry()
             post_callback(callback_url, callback_token, {
