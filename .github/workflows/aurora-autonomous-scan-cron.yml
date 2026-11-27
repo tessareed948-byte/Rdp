@@ -18,13 +18,17 @@ jobs:
           BRIDGE_CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
         run: |
           set -euo pipefail
-          RESP=$(curl -sS --max-time 55 -w "\n%{http_code}" -X POST "https://trade.eunknowntech.com/api/automation/cycle" \
+          CRON_SECRET=$(printf '%s' "${CRON_SECRET:-}" | tr -d '\r\n')
+          BRIDGE_CALLBACK_TOKEN=$(printf '%s' "${BRIDGE_CALLBACK_TOKEN:-}" | tr -d '\r\n')
+          AUTH_KEY="${CRON_SECRET:-$BRIDGE_CALLBACK_TOKEN}"
+          CODE=$(curl -sS --max-time 55 -o /tmp/manual_scan.txt -w "%{http_code}" -X POST "https://trade.eunknowntech.com/api/automation/cycle" \
             -A "AuroraTrade-AutoScanner/1.0" \
             -H "Content-Type: application/json" \
-            -H "X-API-Key: $CRON_SECRET" \
+            -H "X-API-Key: $AUTH_KEY" \
             -H "X-Bridge-Callback-Token: $BRIDGE_CALLBACK_TOKEN" \
-            -H "Authorization: Bearer $CRON_SECRET" \
+            -H "Authorization: Bearer $AUTH_KEY" \
             -d '{"style":"DAY_TRADING","useGeminiGate":false,"dispatchToGitHub":true}')
-          CODE=$(echo "$RESP" | tail -n1)
           echo "MANUAL_SCAN_HTTP=$CODE"
+          head -c 500 /tmp/manual_scan.txt || true
+          echo ""
           if [ "$CODE" -lt 200 ] || [ "$CODE" -ge 300 ]; then exit 1; fi
